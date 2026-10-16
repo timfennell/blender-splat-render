@@ -148,7 +148,7 @@ class SPIRULA_PT_object(bpy.types.Panel):
 # Panels other engines share that make sense here too.
 _SHARED = ("RENDER_PT_format", "RENDER_PT_frame_range", "RENDER_PT_output", "RENDER_PT_encoding",
            "RENDER_PT_color_management", "RENDER_PT_stamp", "DATA_PT_lens", "DATA_PT_camera",
-           "VIEWLAYER_PT_layer_passes", "DATA_PT_camera_dof", "DATA_PT_camera_dof_aperture", "DATA_PT_light", "DATA_PT_spot", "DATA_PT_context_light",
+           "VIEWLAYER_PT_layer_passes", "DATA_PT_light", "DATA_PT_spot", "DATA_PT_context_light",
            # meshes are rendered by Cycles: its material, world and object panels apply
            "CYCLES_MATERIAL_PT_preview", "CYCLES_MATERIAL_PT_surface", "CYCLES_MATERIAL_PT_settings",
            "CYCLES_MATERIAL_PT_settings_surface", "MATERIAL_PT_context_material", "MATERIAL_PT_viewport",
