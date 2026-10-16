@@ -1,20 +1,15 @@
 """Relighting 3DGS splats with Blender lights, including self-shadowing.
 
-The scan's colours already contain the lighting it was captured under. With
-even, diffuse capture lighting they are close to albedo, so a splat lit by the
-new lights gets
+Made for scans captured with the light fixed to the camera (the subject turned
+between shots): every photo was lit from where it was taken, so each splat's SH
+records how it looks with light and view in the same direction. Relighting reads
+that record directly (see Relighter.colours): the broad part (DC + band 1) in
+each new light's direction gives the diffuse response, and bands 2-3 at the half
+vector between light and camera give the shine. A light at the camera gives the
+scan back; Ambient 1 with no lights gives it back exactly.
 
-    colour = albedo * (ambient + exposure * sum_l  light_l / pi * max(n.l, 0) * visible_l)
-
-computed in linear light (the model's colours are sRGB). Ambient 1 with no
-lights gives back the scan as captured. The whole SH expansion of each splat is
-scaled by the same factor, so sheen and view-dependent colour dim and brighten
-with the light.
-
-n is the splat's thinnest axis, turned towards the camera. visible_l is the
-light left after passing through every splat between the light and this one
-(a deep opacity shadow map), so fur shadows gradually rather than as a hard
-surface.
+Shadows come from a deep opacity map per light: the light left after passing
+through every splat between the light and this one, so fur shadows gradually.
 """
 
 import math
@@ -24,6 +19,25 @@ import numpy as np
 from . import native
 
 C0 = 0.28209479177387814
+C1 = 0.4886025119029199
+_C2 = (1.0925484305920792, -1.0925484305920792, 0.31539156525252005,
+       -1.0925484305920792, 0.5462742152960396)
+_C3 = (-0.5900435899266435, 2.890611442640554, -0.4570457994644658, 0.3731763325901154,
+       -0.4570457994644658, 1.445305721320277, -0.5900435899266435)
+
+
+def sh_basis(d, K):
+    """3DGS real SH basis at unit directions d [M,3]: [M, 1+K] (DC first)."""
+    x, y, z = d[:, 0], d[:, 1], d[:, 2]
+    xx, yy, zz = x * x, y * y, z * z
+    cols = [np.full_like(x, C0), -C1 * y, C1 * z, -C1 * x]
+    c = _C2
+    cols += [c[0] * x * y, c[1] * y * z, c[2] * (2 * zz - xx - yy), c[3] * x * z, c[4] * (xx - yy)]
+    c = _C3
+    cols += [c[0] * y * (3 * xx - yy), c[1] * x * y * z, c[2] * y * (4 * zz - xx - yy),
+             c[3] * z * (2 * zz - 3 * xx - 3 * yy), c[4] * x * (4 * zz - xx - yy),
+             c[5] * z * (xx - yy), c[6] * x * (xx - 3 * yy)]
+    return np.stack(cols[:1 + K], 1)
 
 
 def srgb_to_linear(c):
@@ -34,20 +48,6 @@ def srgb_to_linear(c):
 def linear_to_srgb(c):
     c = np.maximum(c, 0.0)
     return np.where(c <= 0.0031308, c * 12.92, 1.055 * np.power(c, 1 / 2.4) - 0.055)
-
-
-def thin_axes(quats, log_scales):
-    """Each splat's thinnest axis (unit), object space."""
-    q = quats / np.maximum(np.linalg.norm(quats, axis=1, keepdims=True), 1e-12)
-    w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
-    cols = (
-        np.stack([1 - 2 * (y * y + z * z), 2 * (x * y + w * z), 2 * (x * z - w * y)], 1),
-        np.stack([2 * (x * y - w * z), 1 - 2 * (x * x + z * z), 2 * (y * z + w * x)], 1),
-        np.stack([2 * (x * z + w * y), 2 * (y * z - w * x), 1 - 2 * (x * x + y * y)], 1),
-    )
-    k = np.argmin(log_scales, axis=1)[:, None]
-    n = np.where(k == 0, cols[0], np.where(k == 1, cols[1], cols[2]))
-    return n.astype(np.float32)
 
 
 def look_at(eye, target, up_hint=(0.0, 0.0, 1.0)):
@@ -131,7 +131,6 @@ class Relighter:
         self.means = splats["means"]
         self.dc0 = splats["dc"].astype(np.float32)
         self.sh0 = splats["sh"]
-        self.normals = thin_axes(splats["quats"], splats["log_scales"])
         size = np.exp(np.max(splats["log_scales"], axis=1))
         self.splat_size = size.astype(np.float32)
         ls = np.sort(splats["log_scales"], axis=1)
@@ -145,84 +144,106 @@ class Relighter:
         self.corners = np.array([[x, y, z] for x in (lo[0], hi[0]) for y in (lo[1], hi[1])
                                  for z in (lo[2], hi[2])], np.float64)
         c = 0.5 + C0 * self.dc0
-        self.c = c
+        self.c = c.astype(np.float32)
+        self.b1 = (np.ascontiguousarray(self.sh0[:, :3], np.float32)
+                   if self.sh0 is not None and self.sh0.shape[1] >= 3 else None)
         self.albedo_lin = srgb_to_linear(c)          # captured colour as albedo
 
-    def facing_normals(self, cam_pos):
-        """Normals turned towards the camera, cached per camera position."""
-        key = tuple(np.round(cam_pos, 4))
-        if getattr(self, "_n_key", None) != key:
-            n = self.normals.copy()
-            flip = np.einsum('ij,ij->i', n, cam_pos[None, :] - self.means) < 0
-            n[flip] *= -1
-            self._n, self._n_key = n, key
-        return self._n
+    # ---------------------------------------------------------- light model
+    def _light_terms(self, L, gain):
+        """Per-splat direction towards the light (unit), relative irradiance e (1 = the
+        capture light), the shadow-map eye, and the light's mean direction."""
+        if L["type"] == 'SUN':
+            ldir = (-L["dir"] / np.linalg.norm(L["dir"])).astype(np.float32)
+            e = np.full(len(self.means), gain * L["strength"], np.float32)
+            return np.broadcast_to(ldir, self.means.shape), e, self.centre + ldir * self.extent * 50, ldir
+        d = (L["pos"][None, :] - self.means).astype(np.float32)
+        dist = np.sqrt(np.einsum('ij,ij->i', d, d))
+        ldirs = d / np.maximum(dist[:, None], 1e-12)
+        e = gain * L["power"] / (4 * math.pi * np.maximum(dist * L["world_per_object"], 1e-6) ** 2)
+        if L["type"] == 'SPOT':
+            c = -(ldirs @ (L["dir"] / np.linalg.norm(L["dir"])).astype(np.float32))
+            cos_out, cos_in = L["spot_cos"]
+            e = e * np.clip((c - cos_out) / max(cos_in - cos_out, 1e-6), 0, 1)
+        mean_dir = L["pos"] - self.centre
+        mean_dir = (mean_dir / max(np.linalg.norm(mean_dir), 1e-12)).astype(np.float32)
+        return ldirs, e.astype(np.float32), L["pos"], mean_dir
+
+    def diffuse_at(self, dirs):
+        """The captured colour's broad part (DC + band 1) at SH directions `dirs` [N,3]
+        (camera->splat, as 3DGS reads them), clamped at 0.
+
+        The capture light sat at the camera, so this is how the splat looks lit from that
+        direction: for a matte surface, its diffuse response to a light from there."""
+        if self.b1 is None:
+            return np.maximum(self.c, 0.0)
+        if dirs.strides[0] == 0:                     # one direction for all splats (a sun)
+            x, y, z = (float(t) for t in dirs[0])
+            c = self.c + np.einsum('nkc,k->nc', self.b1, np.array([-C1 * y, C1 * z, -C1 * x], np.float32))
+        else:
+            basis = C1 * np.stack([-dirs[:, 1], dirs[:, 2], -dirs[:, 0]], 1).astype(np.float32)
+            c = self.c + np.einsum('nkc,nk->nc', self.b1, basis)
+        return np.maximum(c, 0.0)
+
+    def _shadow(self, eye, shadows, shadow_res, softness, report, name):
+        if not shadows:
+            return 1.0
+        try:
+            sm = DeepShadow(eye, self.centre, self.corners, self.means, self.opacity,
+                            self.occluder_size, shadow_res)
+            return sm.visibility(self.means, 2.0 * self.splat_size, softness)
+        except ValueError as e:
+            report(f"Spirula: no shadows from {name}: {e}")
+            return 1.0
 
     def quick_dc(self, lights, cam_pos, ambient, exposure):
-        """Fast approximate base-colour relight for dragging lights: grey irradiance and a
-        gamma approximation of the sRGB curve, no shadows, no SH."""
-        n = self.facing_normals(cam_pos)
-        E = np.full(len(n), ambient, np.float32)
-        tint = np.zeros(3, np.float32)
+        """Fast base-colour relight for dragging lights: diffuse only, no shadows, no SH,
+        mixed in display space (an approximation the full pass replaces)."""
+        out = self.c * np.float32(ambient ** (1 / 2.2))
         gain = 2.0 ** exposure
         for L in lights:
-            col = np.asarray(L["colour"], np.float32)
-            if L["type"] == 'SUN':
-                ldir = (-L["dir"] / np.linalg.norm(L["dir"])).astype(np.float32)
-                w = gain * L["strength"] / math.pi
-                E += w * np.maximum(n @ ldir, 0)
-            else:
-                dvec = (L["pos"][None, :] - self.means).astype(np.float32)
-                dist = np.sqrt(np.einsum('ij,ij->i', dvec, dvec))
-                cosv = np.einsum('ij,ij->i', n, dvec) / np.maximum(dist, 1e-12)
-                w = gain * L["power"] / (4 * math.pi * math.pi)
-                E += w * np.maximum(cosv, 0) / np.maximum(dist * L["world_per_object"], 1e-6) ** 2
-            tint += col
-        tint = tint / len(lights) if lights else np.ones(3, np.float32)
-        f = np.power(np.maximum(E, 0), 1 / 2.2)[:, None] * tint[None, :]
-        return ((self.c * f - 0.5) / C0).astype(np.float32)
+            ldirs, e, _, _ = self._light_terms(L, gain)
+            w = np.power(e, np.float32(1 / 2.2))[:, None] * \
+                np.asarray(L["colour"], np.float32)[None, :]
+            out = out + self.diffuse_at(-ldirs) * w
+        return ((out - 0.5) / C0).astype(np.float32)
+
+    def sh_at(self, dirs, first, last):
+        """Sum of SH coefficients first..last-1 (indices into the higher bands) at dirs [N,3]."""
+        B = sh_basis(dirs, self.sh0.shape[1])[:, 1 + first:1 + last]          # [N, k]
+        return np.einsum('nk,nkc->nc', B, self.sh0[:, first:last])
 
     def colours(self, lights, cam_pos, ambient, exposure, shadows, shadow_res, softness,
                 primitive, report=print, diffuse_only=False):
-        """lights: dicts in object space (type, pos, dir, colour rgb, power W or strength,
-        spot cos limits, world_per_object). Returns new dc [N,3] and sh [N,K,3]."""
-        n = self.facing_normals(cam_pos)
-        E = np.full((len(n), 3), ambient, np.float32)
+        """One relit colour per splat for this camera (the renderer evaluates SH once per
+        splat, from the direction to the camera, so that's all it needs). Returns new dc
+        [N,3] and None: render with the higher SH bands switched off.
+
+        diffuse : the captured broad colour (DC + band 1) read in each light's direction --
+                  the capture light sat at the camera, so that is how the splat looks lit
+                  from there -- times the light's relative irradiance and shadow, summed in
+                  linear light.
+        shine   : SH bands 2-3 read at the half vector between the light and the camera.
+                  The capture had light = view, so its half vector was the view itself.
+        ambient : a share of the scan exactly as captured (all bands, seen from the camera).
+        With one light at the camera and no ambient this gives back the scan."""
         gain = 2.0 ** exposure
-        bias = 2.0 * self.splat_size                 # don't let a splat shadow itself
+        # 3DGS reads SH at the camera->splat direction.
+        v = (self.means - cam_pos[None, :]).astype(np.float32)
+        v /= np.maximum(np.linalg.norm(v, axis=1, keepdims=True), 1e-12)
+        lin = self.albedo_lin * ambient
+        shine = np.zeros_like(self.c)
+        has_sh = self.sh0 is not None and self.sh0.shape[1] >= 8 and not diffuse_only
+        if has_sh and ambient > 0:
+            shine += ambient ** (1 / 2.2) * self.sh_at(v, 0, self.sh0.shape[1])
         for L in lights:
-            if L["type"] == 'SUN':
-                ldir = -L["dir"] / np.linalg.norm(L["dir"])     # towards the light
-                irr = np.full(len(n), L["strength"], np.float32)
-                cosv = n @ ldir.astype(np.float32)
-                eye = self.centre + ldir * self.extent * 50
-            else:
-                d = L["pos"][None, :] - self.means
-                dist = np.linalg.norm(d, axis=1)
-                ldirs = d / np.maximum(dist[:, None], 1e-12)
-                cosv = np.einsum('ij,ij->i', n, ldirs)
-                dist_w = dist * L["world_per_object"]
-                irr = L["power"] / (4 * math.pi * np.maximum(dist_w, 1e-6) ** 2)
-                if L["type"] == 'SPOT':
-                    c = -(ldirs @ (L["dir"] / np.linalg.norm(L["dir"])).astype(np.float32))
-                    cos_out, cos_in = L["spot_cos"]
-                    irr = irr * np.clip((c - cos_out) / max(cos_in - cos_out, 1e-6), 0, 1)
-                eye = L["pos"]
-            vis = 1.0
-            if shadows:
-                try:
-                    sm = DeepShadow(eye, self.centre, self.corners, self.means, self.opacity,
-                                    self.occluder_size, shadow_res)
-                    vis = sm.visibility(self.means, bias, softness)
-                except ValueError as e:
-                    report(f"Spirula: no shadows from {L['name']}: {e}")
-            E += (gain * irr / math.pi * np.maximum(cosv, 0) * vis)[:, None] * \
-                np.asarray(L["colour"], np.float32)[None, :]
-        lit = linear_to_srgb(self.albedo_lin * E)
-        # Ratio of new to captured colour; splats captured black stay as they were.
-        f = np.where(self.c > 1e-4, lit / np.maximum(self.c, 1e-4), 1.0).astype(np.float32)
-        dc = np.where(self.c > 1e-4, (lit - 0.5) / C0, self.dc0).astype(np.float32)
-        if diffuse_only or self.sh0 is None:
-            return dc, None
-        sh = (self.sh0 * f[:, None, :]).astype(np.float32)
-        return dc, sh
+            ldirs, e, eye, _ = self._light_terms(L, gain)
+            vis = self._shadow(eye, shadows, shadow_res, softness, report, L["name"])
+            w = (e * vis)[:, None] * np.asarray(L["colour"], np.float32)[None, :]
+            lin = lin + srgb_to_linear(self.diffuse_at(-ldirs)) * w
+            if has_sh:
+                h = v - ldirs
+                h /= np.maximum(np.linalg.norm(h, axis=1, keepdims=True), 1e-12)
+                shine += np.power(np.maximum(w, 0), 1 / 2.2) * self.sh_at(h, 3, self.sh0.shape[1])
+        out = linear_to_srgb(lin) + shine
+        return ((out - 0.5) / C0).astype(np.float32), None

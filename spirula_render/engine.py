@@ -67,7 +67,8 @@ def _lights_key(lights, settings, shadows):
             shadows, settings.shadow_resolution, settings.shadow_softness)
 
 
-def _ensure_colours(depsgraph, obj, cam_world, settings, report, follow_camera=True, quick=False):
+def _ensure_colours(depsgraph, obj, cam_world, settings, report, follow_camera=True, quick=False,
+                    viewport=False):
     """Put the right colours on the GPU: the original ones, or relit by the scene's lights.
 
     follow_camera=False (viewport) keeps the last relit colours while only the view
@@ -86,7 +87,7 @@ def _ensure_colours(depsgraph, obj, cam_world, settings, report, follow_camera=T
     lights = _object_space_lights(depsgraph, obj.matrix_world)
     Minv = np.linalg.inv(np.array(obj.matrix_world, np.float64))
     cam_pos = (Minv @ np.array(cam_world, np.float64)[:, 3])[:3].astype(np.float32)
-    shadows = settings.use_shadows and (follow_camera or settings.viewport_shadows) and not quick
+    shadows = settings.use_shadows and (not viewport or settings.viewport_shadows) and not quick
     key = _lights_key(lights, settings, shadows) + ("quick" if quick else "full",)
     if follow_camera:
         key = key + (tuple(np.round(cam_pos, 5)),)
@@ -101,7 +102,8 @@ def _ensure_colours(depsgraph, obj, cam_world, settings, report, follow_camera=T
             diffuse_only=quick)
         native.set_colors(dc, sh)
         _CACHE["colour_key"] = key
-    native.set_render_degree(0 if quick else -1)
+    # Relit colours are baked per splat for this camera: render without the higher bands.
+    native.set_render_degree(0)
     return _lights_key(lights, settings, settings.use_shadows)
 
 
@@ -111,7 +113,7 @@ def _splat_objects(depsgraph):
 
 
 def _render_view(depsgraph, settings, cam_world, V_of_obj, fx, fy, cx, cy, W, H, report,
-                 follow_camera=True, quick=False):
+                 follow_camera=True, quick=False, viewport=False):
     """Render the scene's splat object. Returns linear premultiplied rgb, alpha, ray depth."""
     splats = _splat_objects(depsgraph)
     if not splats:
@@ -122,7 +124,7 @@ def _render_view(depsgraph, settings, cam_world, V_of_obj, fx, fy, cx, cy, W, H,
     original = bpy.data.objects.get(obj.name)              # attribute data lives here
     with _LOCK:
         _upload(original if original is not None else obj)
-        _ensure_colours(depsgraph, obj, cam_world, settings, report, follow_camera, quick)
+        _ensure_colours(depsgraph, obj, cam_world, settings, report, follow_camera, quick, viewport)
         rgb, alpha, d = native.render(V_of_obj(obj), fx, fy, cx, cy, W, H, settings.primitive)
     if settings.colour_input == 'SRGB':
         # The renderer blends in the model's (sRGB) space; Blender wants linear.
@@ -275,8 +277,10 @@ class SpirulaRenderEngine(bpy.types.RenderEngine):
         if settings.use_relight:
             splats_now = _splat_objects(depsgraph)
             if splats_now:
-                lk = _lights_key(_object_space_lights(depsgraph, splats_now[0].matrix_world),
-                                 settings, settings.use_shadows)
+                # Relit colours depend on the lights AND (for shine and view-dependent
+                # colour) on where the camera is, so moving either refines afterwards.
+                lk = (_lights_key(_object_space_lights(depsgraph, splats_now[0].matrix_world),
+                                  settings, settings.use_shadows), view_key[0])
                 now = time.time()
                 if lk != v["lights"]:
                     if v["lights"] is not None:
@@ -299,7 +303,8 @@ class SpirulaRenderEngine(bpy.types.RenderEngine):
             V, fx, fy, cx, cy, cam_world = _viewport_camera(rv3d, W, H, obj_world, size)
             try:
                 out = _render_view(depsgraph, settings, cam_world, lambda obj: V, fx, fy, cx, cy,
-                                   W, H, lambda m: None, follow_camera=False, quick=quick)
+                                   W, H, lambda m: None, follow_camera=not quick, quick=quick,
+                                   viewport=True)
             except native.RenderError as e:
                 out = None
                 print("Spirula viewport:", e)
