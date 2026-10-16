@@ -30,6 +30,10 @@ class SpirulaSettings(bpy.types.PropertyGroup):
     exposure: bpy.props.FloatProperty(
         name="Exposure", default=0.0, soft_min=-6, soft_max=6,
         description="Brightness of the scene's lights, in stops (light units follow Cycles)")
+    shine_colour: bpy.props.FloatProperty(
+        name="Shine Colour", default=0.25, min=0.0, max=1.0, subtype='FACTOR',
+        description="How much of the scan's captured colour the highlights take (0 = neutral highlights). "
+                    "Higher keeps iridescence but can show false colour where the capture never looked")
     use_shadows: bpy.props.BoolProperty(
         name="Shadows", default=True, description="The model casts shadows onto itself")
     viewport_shadows: bpy.props.BoolProperty(
@@ -75,6 +79,7 @@ class SPIRULA_PT_render(bpy.types.Panel):
         col.active = s.use_relight
         col.prop(s, "ambient")
         col.prop(s, "exposure")
+        col.prop(s, "shine_colour", slider=True)
         col.prop(s, "use_shadows")
         sub = col.column()
         sub.active = s.use_shadows

@@ -92,6 +92,7 @@ def _lights_key(lights, settings, shadows):
         rows.append((L["type"], tuple(np.round(L["pos"], 6)), tuple(np.round(L["dir"], 6)),
                      tuple(np.round(L["colour"], 4)), round(L["power"], 4), L.get("spot_cos")))
     return (tuple(rows), round(settings.ambient, 5), round(settings.exposure, 4),
+            round(settings.shine_colour, 4),
             shadows, settings.shadow_resolution, settings.shadow_softness)
 
 
@@ -112,6 +113,7 @@ def _ensure_colours(depsgraph, obj, cam_world, settings, report, follow_camera=T
         return None
     if _CACHE.get("relighter") is None:
         _CACHE["relighter"] = relight.Relighter(d)
+    _CACHE["relighter"].shine_colour = settings.shine_colour
     lights = _object_space_lights(depsgraph, _IDENTITY)
     Minv = _IDENTITY
     cam_pos = (Minv @ np.array(cam_world, np.float64)[:, 3])[:3].astype(np.float32)

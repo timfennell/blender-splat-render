@@ -77,14 +77,10 @@ class DeepShadow:
     running sum of log transmittance gives the light left at any depth there.
     """
 
-    def __init__(self, eye, target, corners, means, opacity, size, res):
-        self.V = look_at(eye, target)
-        pc = corners @ self.V[:3, :3].T + self.V[:3, 3]
-        if np.any(pc[:, 2] <= 1e-9):
-            raise ValueError("light is inside the model's bounds")
-        t = np.max(np.abs(pc[:, :2]) / pc[:, 2:3])
-        self.f = (res / 2) / (t * 1.05)
-        self.res = res
+    def __init__(self, V, f, res, means, opacity, size):
+        """V: world->light camera (OpenCV axes), f: focal length in pixels. Every splat
+        given here must be in front of the light and inside its view."""
+        self.V, self.f, self.res = V, f, res
         u, v, dist, z = self._project(means)
         iu = np.clip(np.floor(u).astype(np.int64), 0, res - 1)
         iv = np.clip(np.floor(v).astype(np.int64), 0, res - 1)
@@ -93,7 +89,7 @@ class DeepShadow:
         r_pix = 2.0 * size * self.f / np.maximum(z, 1e-9)
         cover = np.minimum(1.0, math.pi * r_pix * r_pix)
         a = np.clip(opacity * cover, 0.0, 0.999)
-        self.dmax = float(dist.max()) * 1.0001 + 1e-9
+        self.dmax = (float(dist.max()) if len(dist) else 1.0) * 1.0001 + 1e-9
         key = (iv * res + iu).astype(np.float64) + dist / self.dmax
         order = np.argsort(key, kind="stable")
         self.key = key[order]
@@ -109,7 +105,7 @@ class DeepShadow:
     def visibility(self, means, bias, radius=1):
         """Light reaching each splat centre, 0..1, averaged over nearby pixels for soft edges."""
         u, v, dist, _ = self._project(means)
-        d = np.maximum(dist - bias, 0.0) / self.dmax
+        d = np.minimum(np.maximum(dist - bias, 0.0) / self.dmax, 0.9999)
         total = np.zeros(len(means), np.float64)
         taps = 0
         for du in range(-radius, radius + 1):
@@ -122,6 +118,43 @@ class DeepShadow:
                 total += np.exp(self.cum[stop] - self.cum[start])
                 taps += 1
         return (total / taps).astype(np.float32)
+
+
+def light_visibility(eye, target, corners, means, opacity, size, query, bias, res, softness):
+    """Light reaching each `query` splat from a light at `eye` (deep opacity shadows).
+
+    One map aimed at the model when it fits in a reasonable field of view; otherwise
+    (a light close to or inside the model) a cube of six maps around the light."""
+    V = look_at(eye, target)
+    pc = corners @ V[:3, :3].T + V[:3, 3]
+    if np.all(pc[:, 2] > 1e-9):
+        t = float(np.max(np.abs(pc[:, :2]) / pc[:, 2:3]))
+        if t < 1.6:                                  # under ~116 degrees: one map
+            sm = DeepShadow(V, (res / 2) / (t * 1.05), res, means, opacity, size)
+            return sm.visibility(query, bias, softness)
+    eye = np.asarray(eye, np.float64)
+    rel_all = (means - eye).astype(np.float32)
+    rel_q = (query - eye).astype(np.float32)
+    face_q = np.argmax(np.abs(rel_q), axis=1) * 2 + (np.take_along_axis(
+        rel_q, np.argmax(np.abs(rel_q), axis=1)[:, None], 1)[:, 0] < 0)
+    vis = np.ones(len(query), np.float32)
+    ups = [(0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 1, 0), (0, 1, 0)]
+    for axis in range(3):
+        for sign_i, sign in enumerate((1.0, -1.0)):
+            face = axis * 2 + sign_i
+            q = np.nonzero(face_q == face)[0]
+            if len(q) == 0:
+                continue
+            d = np.zeros(3); d[axis] = sign
+            Vf = look_at(eye, eye + d, ups[face])
+            # occluders: splats in front of this face, within its (slightly widened) view
+            pcs = rel_all @ Vf[:3, :3].T.astype(np.float32)
+            z = pcs[:, 2]
+            inside = (z > 1e-9) & (np.abs(pcs[:, 0]) <= 1.05 * z) & (np.abs(pcs[:, 1]) <= 1.05 * z)
+            f = (res / 2) / 1.05
+            sm = DeepShadow(Vf, f, res, means[inside], opacity[inside], size[inside])
+            vis[q] = sm.visibility(query[q], bias[q] if np.ndim(bias) else bias, softness)
+    return vis
 
 
 class Relighter:
@@ -188,13 +221,9 @@ class Relighter:
     def _shadow(self, eye, shadows, shadow_res, softness, report, name):
         if not shadows:
             return 1.0
-        try:
-            sm = DeepShadow(eye, self.centre, self.corners, self.means, self.opacity,
-                            self.occluder_size, shadow_res)
-            return sm.visibility(self.means, 2.0 * self.splat_size, softness)
-        except ValueError as e:
-            report(f"Spirula: no shadows from {name}: {e}")
-            return 1.0
+        return light_visibility(eye, self.centre, self.corners, self.means, self.opacity,
+                                self.occluder_size, self.means, 2.0 * self.splat_size,
+                                shadow_res, softness)
 
     def quick_dc(self, lights, cam_pos, ambient, exposure):
         """Fast base-colour relight for dragging lights: diffuse only, no shadows, no SH,
@@ -207,6 +236,23 @@ class Relighter:
                 np.asarray(L["colour"], np.float32)[None, :]
             out = out + self.diffuse_at(-ldirs) * w
         return ((out - 0.5) / C0).astype(np.float32)
+
+    shine_colour = 0.25        # 0: neutral (brightness only) ... 1: the full captured colour
+
+    def shine_at(self, h):
+        """The shine seen at half vector h: brightness from SH bands 2-3, colour from the full
+        captured colour there. Bands 2-3 also hold terms that only cancel the lower bands
+        (often strongly coloured); evaluated apart from them those would show as false
+        colour, so only their brightness is used."""
+        K = self.sh0.shape[1]
+        S = self.sh_at(h, 3, K)
+        full = np.maximum(self.diffuse_at(h) + S, 0.0)
+        lum_w = np.array([0.2126, 0.7152, 0.0722], np.float32)
+        Ls = S @ lum_w
+        Lf = full @ lum_w
+        chroma = np.where(Lf[:, None] > 1e-3, full / np.maximum(Lf, 1e-3)[:, None], 1.0)
+        k = np.float32(self.shine_colour)
+        return Ls[:, None] * ((1 - k) + k * chroma)
 
     def sh_at(self, dirs, first, last):
         """Sum of SH coefficients first..last-1 (indices into the higher bands) at dirs [N,3]."""
@@ -244,6 +290,6 @@ class Relighter:
             if has_sh:
                 h = v - ldirs
                 h /= np.maximum(np.linalg.norm(h, axis=1, keepdims=True), 1e-12)
-                shine += np.power(np.maximum(w, 0), 1 / 2.2) * self.sh_at(h, 3, self.sh0.shape[1])
-        out = linear_to_srgb(lin) + shine
+                shine += np.power(np.maximum(w, 0), 1 / 2.2) * self.shine_at(h)
+        out = np.maximum(linear_to_srgb(lin) + shine, 0.0)
         return ((out - 0.5) / C0).astype(np.float32), None
