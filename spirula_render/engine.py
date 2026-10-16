@@ -119,12 +119,15 @@ def _ensure_colours(depsgraph, obj, cam_world, settings, report, follow_camera=T
     Minv = _IDENTITY
     cam_pos = (Minv @ np.array(cam_world, np.float64)[:, 3])[:3].astype(np.float32)
     shadows = settings.use_shadows and (not viewport or settings.viewport_shadows) and not quick
-    key = _lights_key(lights, settings, shadows) + ("quick" if quick else "full",)
+    key = _lights_key(lights, settings, shadows or (quick and settings.viewport_shadows)) + \
+        ("quick" if quick else "full",)
     if follow_camera:
         key = key + (tuple(np.round(cam_pos, 5)),)
     if _CACHE["colour_key"] != key and quick:
-        native.set_colors(_CACHE["relighter"].quick_dc(lights, cam_pos, settings.ambient,
-                                                       settings.exposure), None)
+        lod_shadows = settings.use_shadows and settings.viewport_shadows
+        native.set_colors(_CACHE["relighter"].quick_dc(
+            lights, cam_pos, settings.ambient, settings.exposure, lod_shadows,
+            max(256, settings.shadow_resolution // 2)), None)
         _CACHE["colour_key"] = key
     elif _CACHE["colour_key"] != key:
         dc, sh = _CACHE["relighter"].colours(
