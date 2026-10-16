@@ -18,6 +18,22 @@ space, so they overlap and shadow each other), perspective scene cameras, macOS 
 With **Relight** on, the scene's lights light the splats, and the splats shadow themselves and each
 other.
 
+## Platforms
+
+**macOS on Apple Silicon only, for now.** The add-on ships one compiled library,
+`libspirula_render.dylib`, built for arm64 macOS with MoltenVK linked in; Blender won't install the
+extension on other systems (its manifest lists only `macos-arm64`).
+
+Nothing in the approach is Mac-specific. Spirula Studio's renderer runs on Windows and Linux too
+(Vulkan on NVIDIA, AMD and Intel GPUs), and the rest of the add-on is Python and Blender's own GPU
+API. A port needs:
+
+- the `spirula_render` library built on each system: the macOS-only linker flag that limits its
+  exports becomes a version script on Linux and `dllexport` on Windows;
+- the add-on loading `libspirula_render.so` / `spirula_render.dll` by platform;
+- one release zip per platform;
+- testing on real Windows and Linux machines with a GPU.
+
 ## Depth of field
 
 Turn on the camera's Depth of Field (Camera properties) as for any Blender render: focus distance
