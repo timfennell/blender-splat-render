@@ -16,6 +16,23 @@ class SpirulaSettings(bpy.types.PropertyGroup):
         items=[('SRGB', "sRGB", "Splats were trained on ordinary (sRGB) photos: convert to Blender's "
                                 "linear space after blending, as the trainer saw them"),
                ('LINEAR', "Linear", "Splats were trained on linear images (e.g. RAW)")])
+    use_relight: bpy.props.BoolProperty(
+        name="Relight", default=False,
+        description="Light the splats with the scene's lights instead of the lighting baked into the scan")
+    ambient: bpy.props.FloatProperty(
+        name="Ambient", default=0.15, min=0.0, soft_max=1.0,
+        description="How much of the captured lighting is kept everywhere (1 with no lights = the scan as captured)")
+    exposure: bpy.props.FloatProperty(
+        name="Exposure", default=0.0, soft_min=-6, soft_max=6,
+        description="Brightness of the scene's lights, in stops (light units follow Cycles)")
+    use_shadows: bpy.props.BoolProperty(
+        name="Shadows", default=True, description="The model casts shadows onto itself")
+    shadow_resolution: bpy.props.IntProperty(
+        name="Shadow Resolution", default=1024, min=128, max=4096,
+        description="Size of each light's deep shadow map in pixels (finer = sharper shadows)")
+    shadow_softness: bpy.props.IntProperty(
+        name="Softness", default=1, min=0, max=6,
+        description="Shadow edge filter radius in shadow-map pixels")
 
 
 class SPIRULA_PT_render(bpy.types.Panel):
@@ -42,12 +59,23 @@ class SPIRULA_PT_render(bpy.types.Panel):
             box.label(text="Use Standard to match the trained colours exactly")
             box.prop(vs, "view_transform")
         layout.prop(context.scene.render, "film_transparent")
+        layout.separator()
+        layout.prop(s, "use_relight")
+        col = layout.column()
+        col.active = s.use_relight
+        col.prop(s, "ambient")
+        col.prop(s, "exposure")
+        col.prop(s, "use_shadows")
+        sub = col.column()
+        sub.active = s.use_shadows
+        sub.prop(s, "shadow_resolution")
+        sub.prop(s, "shadow_softness")
 
 
 # Panels other engines share that make sense here too.
 _SHARED = ("RENDER_PT_format", "RENDER_PT_frame_range", "RENDER_PT_output", "RENDER_PT_encoding",
            "RENDER_PT_color_management", "RENDER_PT_stamp", "DATA_PT_lens", "DATA_PT_camera",
-           "VIEWLAYER_PT_layer_passes")
+           "VIEWLAYER_PT_layer_passes", "DATA_PT_light", "DATA_PT_spot", "DATA_PT_context_light")
 
 
 def _panels(add):

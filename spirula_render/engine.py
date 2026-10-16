@@ -5,7 +5,9 @@ import time
 import bpy
 import numpy as np
 
-from . import native, scene_data as sd
+import math
+
+from . import native, relight, scene_data as sd
 
 # What's uploaded right now, so animation frames don't re-upload unchanged splats.
 _CACHE = {"key": None}
@@ -24,9 +26,52 @@ def _upload(obj):
     d = sd.splat_arrays(obj.data)
     native.set_splats(d["means"], d["quats"], d["log_scales"], d["logit_opacities"],
                       d["dc"], d["sh"], d["degree"])
-    _CACHE["key"] = key
-    _CACHE["n"] = d["n"]
+    _CACHE.update(key=key, n=d["n"], splats=d, relighter=None, lit=False)
     return True
+
+
+def _object_space_lights(depsgraph, obj_world):
+    """Blender lights, moved into the splat object's space."""
+    Minv = np.linalg.inv(np.array(obj_world, np.float64))
+    per_obj = float(np.mean(np.linalg.norm(np.array(obj_world)[:3, :3], axis=0)))
+    out = []
+    for inst in depsgraph.object_instances:
+        ob = inst.object
+        if ob.type != 'LIGHT':
+            continue
+        L = ob.data
+        Mw = np.array(inst.matrix_world, np.float64)
+        pos = (Minv @ Mw[:, 3])[:3]
+        d = Minv[:3, :3] @ (Mw[:3, :3] @ np.array([0.0, 0.0, -1.0]))
+        d /= np.linalg.norm(d)
+        light = dict(name=ob.name, type=L.type if L.type in ('SUN', 'SPOT') else 'POINT',
+                     pos=pos, dir=d, colour=tuple(L.color), world_per_object=per_obj,
+                     strength=float(L.energy), power=float(L.energy))
+        if L.type == 'SPOT':
+            half = L.spot_size / 2
+            light["spot_cos"] = (math.cos(half), math.cos(half * (1 - L.spot_blend)))
+        out.append(light)
+    return out
+
+
+def _apply_lighting(depsgraph, obj, cam_world, settings, report):
+    """Relight (or restore) the uploaded splats' colours for this frame."""
+    d = _CACHE["splats"]
+    if not settings.use_relight:
+        if _CACHE.get("lit"):
+            native.set_colors(d["dc"], d["sh"])
+            _CACHE["lit"] = False
+        return
+    if _CACHE.get("relighter") is None:
+        _CACHE["relighter"] = relight.Relighter(d)
+    lights = _object_space_lights(depsgraph, obj.matrix_world)
+    Minv = np.linalg.inv(np.array(obj.matrix_world, np.float64))
+    cam_pos = (Minv @ np.array(cam_world, np.float64)[:, 3])[:3].astype(np.float32)
+    dc, sh = _CACHE["relighter"].colours(
+        lights, cam_pos, settings.ambient, settings.exposure, settings.use_shadows,
+        settings.shadow_resolution, settings.shadow_softness, settings.primitive, report)
+    native.set_colors(dc, sh)
+    _CACHE["lit"] = True
 
 
 def _write_pass(render_pass, pixels):
@@ -79,6 +124,10 @@ class SpirulaRenderEngine(bpy.types.RenderEngine):
             t0 = time.time()
             self.update_stats("", f"Spirula: loading {obj.name}")
             uploaded = _upload(original if original is not None else obj)
+            if settings.use_relight or _CACHE.get("lit"):
+                self.update_stats("", "Spirula: relighting")
+                _apply_lighting(depsgraph, obj, cam_world, settings,
+                                lambda m: self.report({'WARNING'}, m))
             V = sd.view_matrix(cam_world, obj.matrix_world)
             self.update_stats("", f"Spirula: rendering {_CACHE['n']:,} splats")
             rgb, alpha, d = native.render(V, fx, fy, cx, cy, W, H, settings.primitive)

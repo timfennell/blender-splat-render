@@ -28,6 +28,11 @@ def lib():
         L.sr_render.argtypes = [_FP] + [ctypes.c_float] * 4 + [ctypes.c_int, ctypes.c_int,
                                                                  ctypes.c_char_p, _FP, _FP, _FP]
         L.sr_render.restype = ctypes.c_int
+        L.sr_render_ex.argtypes = [_FP] + [ctypes.c_float] * 4 + [ctypes.c_int, ctypes.c_int,
+                                                                    ctypes.c_char_p, _FP, _FP, _FP, _FP]
+        L.sr_render_ex.restype = ctypes.c_int
+        L.sr_set_colors.argtypes = [_FP, _FP]
+        L.sr_set_colors.restype = ctypes.c_int
         _LIB = L
     return _LIB
 
@@ -60,3 +65,22 @@ def render(viewmat, fx, fy, cx, cy, width, height, primitive="3dgs"):
     _check(lib().sr_render(_p(V), fx, fy, cx, cy, width, height, primitive.encode(),
                            _p(rgb), _p(alpha), _p(depth)), "rendering")
     return rgb, alpha, depth
+
+
+def set_colors(dc, sh):
+    """Replace colours in place: dc [N,3], sh [N,K,3] or None (same N and degree as loaded)."""
+    dc = np.ascontiguousarray(dc, np.float32)
+    sh = None if sh is None else np.ascontiguousarray(sh, np.float32)
+    _check(lib().sr_set_colors(_p(dc), _p(sh)), "updating colours")
+
+
+def render_ex(viewmat, fx, fy, cx, cy, width, height, primitive="3dgs"):
+    """render() plus the per-pixel median depth. Returns rgb, alpha, depth, median."""
+    V = np.ascontiguousarray(viewmat, np.float32).ravel()
+    rgb = np.zeros((height, width, 3), np.float32)
+    alpha = np.zeros((height, width), np.float32)
+    depth = np.zeros((height, width), np.float32)
+    median = np.zeros((height, width), np.float32)
+    _check(lib().sr_render_ex(_p(V), fx, fy, cx, cy, width, height, primitive.encode(),
+                              _p(rgb), _p(alpha), _p(depth), _p(median)), "rendering")
+    return rgb, alpha, depth, median
