@@ -8,7 +8,7 @@ Pick **Spirula (3DGS)** as the render engine; F12 and Render Animation work as u
 camera. Splats erased with the Gaussian Splat Patch add-on are left out.
 
 Status: early. Final renders and the viewport's Rendered mode (perspective, orthographic and camera
-view; renders at half resolution by default). One splat object per scene, perspective scene cameras,
+view; renders at half resolution by default). Any number of splat objects (merged per frame in world space, so they overlap and shadow each other), perspective scene cameras,
 macOS (Apple Silicon). Splats only: meshes and lights are not rendered.
 
 The renderer library is built from a branch of Spirula Studio (`blender-render`, target

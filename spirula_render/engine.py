@@ -9,7 +9,7 @@ import gpu
 import numpy as np
 from gpu_extras.presets import draw_texture_2d
 
-from . import native, relight, scene_data as sd
+from . import native, relight, scene_data as sd, transform
 
 # One renderer (one GPU context and one uploaded splat set) serves the viewport and
 # final renders, which can run at the same time on different threads.
@@ -23,11 +23,39 @@ def _splat_key(obj):
             obj.name, tuple(a.name for a in pc.attributes))
 
 
-def _upload(obj):
-    key = _splat_key(obj)
+_IDENTITY = np.eye(4)
+_OBJECTS = {}           # object name -> (data key, matrix key, world-space arrays)
+
+
+def _upload_scene(objs, report):
+    """Merge every splat object into one world-space set and upload it if anything changed.
+
+    Each object is moved into world space (positions, rotations, scales and its SH rotated
+    with it) once per change of its data or transform, so all models sort, overlap and
+    shadow each other in a single render."""
+    keys = []
+    parts = []
+    for ob in objs:
+        original = bpy.data.objects.get(ob.name) or ob     # attribute data lives here
+        dkey = _splat_key(original)
+        mkey = tuple(np.round(np.array(ob.matrix_world, np.float64), 7).ravel())
+        cached = _OBJECTS.get(ob.name)
+        if cached is None or cached[0] != dkey or cached[1] != mkey:
+            local = sd.splat_arrays(original.data)
+            world = transform.to_world(local, ob.matrix_world)
+            if world.get("nonuniform"):
+                report(f"Spirula: '{ob.name}' has a non-uniform scale; using its average scale")
+            cached = (dkey, mkey, world)
+            _OBJECTS[ob.name] = cached
+        keys.append((ob.name, dkey, mkey))
+        parts.append(cached[2])
+    for name in list(_OBJECTS):
+        if name not in {ob.name for ob in objs}:
+            del _OBJECTS[name]
+    key = tuple(keys)
     if _CACHE["key"] == key:
         return False
-    d = sd.splat_arrays(obj.data)
+    d = parts[0] if len(parts) == 1 else transform.merge(parts)
     native.set_splats(d["means"], d["quats"], d["log_scales"], d["logit_opacities"],
                       d["dc"], d["sh"], d["degree"])
     _CACHE.update(key=key, n=d["n"], splats=d, relighter=None, colour_key=None)
@@ -84,8 +112,8 @@ def _ensure_colours(depsgraph, obj, cam_world, settings, report, follow_camera=T
         return None
     if _CACHE.get("relighter") is None:
         _CACHE["relighter"] = relight.Relighter(d)
-    lights = _object_space_lights(depsgraph, obj.matrix_world)
-    Minv = np.linalg.inv(np.array(obj.matrix_world, np.float64))
+    lights = _object_space_lights(depsgraph, _IDENTITY)
+    Minv = _IDENTITY
     cam_pos = (Minv @ np.array(cam_world, np.float64)[:, 3])[:3].astype(np.float32)
     shadows = settings.use_shadows and (not viewport or settings.viewport_shadows) and not quick
     key = _lights_key(lights, settings, shadows) + ("quick" if quick else "full",)
@@ -112,20 +140,17 @@ def _splat_objects(depsgraph):
             if not inst.is_instance and sd.is_splat_object(inst.object)]
 
 
-def _render_view(depsgraph, settings, cam_world, V_of_obj, fx, fy, cx, cy, W, H, report,
+def _render_view(depsgraph, settings, cam_world, V_of_world, fx, fy, cx, cy, W, H, report,
                  follow_camera=True, quick=False, viewport=False):
     """Render the scene's splat object. Returns linear premultiplied rgb, alpha, ray depth."""
     splats = _splat_objects(depsgraph)
     if not splats:
         return None
-    if len(splats) > 1:
-        report(f"Spirula renders one splat object; using '{splats[0].name}' (join the others into it)")
-    obj = splats[0]
-    original = bpy.data.objects.get(obj.name)              # attribute data lives here
+    obj = None
     with _LOCK:
-        _upload(original if original is not None else obj)
+        _upload_scene(splats, report)
         _ensure_colours(depsgraph, obj, cam_world, settings, report, follow_camera, quick, viewport)
-        rgb, alpha, d = native.render(V_of_obj(obj), fx, fy, cx, cy, W, H, settings.primitive)
+        rgb, alpha, d = native.render(V_of_world(), fx, fy, cx, cy, W, H, settings.primitive)
     if settings.colour_input == 'SRGB':
         # The renderer blends in the model's (sRGB) space; Blender wants linear.
         a = alpha[..., None]
@@ -225,7 +250,7 @@ class SpirulaRenderEngine(bpy.types.RenderEngine):
         t0 = time.time()
         self.update_stats("", "Spirula: rendering")
         out = _render_view(depsgraph, settings, cam_world,
-                           lambda obj: sd.view_matrix(cam_world, obj.matrix_world),
+                           lambda: sd.view_matrix(cam_world, _IDENTITY),
                            fx, fy, cx, cy, W, H, lambda m: self.report({'WARNING'}, m),
                            quick=False)
         if out is None:
@@ -279,7 +304,7 @@ class SpirulaRenderEngine(bpy.types.RenderEngine):
             if splats_now:
                 # Relit colours depend on the lights AND (for shine and view-dependent
                 # colour) on where the camera is, so moving either refines afterwards.
-                lk = (_lights_key(_object_space_lights(depsgraph, splats_now[0].matrix_world),
+                lk = (_lights_key(_object_space_lights(depsgraph, _IDENTITY),
                                   settings, settings.use_shadows), view_key[0])
                 now = time.time()
                 if lk != v["lights"]:
@@ -299,10 +324,10 @@ class SpirulaRenderEngine(bpy.types.RenderEngine):
             size = 1.0
             if splats and _CACHE.get("relighter") is not None:
                 size = _CACHE["relighter"].extent
-            obj_world = splats[0].matrix_world if splats else np.eye(4)
+            obj_world = _IDENTITY
             V, fx, fy, cx, cy, cam_world = _viewport_camera(rv3d, W, H, obj_world, size)
             try:
-                out = _render_view(depsgraph, settings, cam_world, lambda obj: V, fx, fy, cx, cy,
+                out = _render_view(depsgraph, settings, cam_world, lambda: V, fx, fy, cx, cy,
                                    W, H, lambda m: None, follow_camera=not quick, quick=quick,
                                    viewport=True)
             except native.RenderError as e:
