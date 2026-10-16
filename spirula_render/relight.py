@@ -114,10 +114,12 @@ class DeepShadow:
         # seen from the light. The binned map above only knows each splat's centre pixel,
         # which undercounts coverage through a thin shell; it is used for depth ORDER only.
         self.gpu_T = None
+        self.gpu_depth = None
         try:
-            _, alpha, _, _ = native.render_ex(np.asarray(V, np.float32), f, f, res / 2, res / 2,
-                                              res, res, "3dgs")
+            _, alpha, depth, _ = native.render_ex(np.asarray(V, np.float32), f, f, res / 2, res / 2,
+                                                  res, res, "3dgs")
             self.gpu_T = np.clip(1.0 - alpha, 1e-6, 1.0).astype(np.float64)
+            self.gpu_alpha, self.gpu_depth = alpha, depth
         except Exception:
             pass
 
@@ -164,6 +166,9 @@ class DeepShadow:
     def visibility(self, means, bias, radius=1):
         """Light reaching each splat centre, 0..1, averaged over nearby pixels for soft edges."""
         u, v, dist, _ = self._project(means)
+        # points outside this light's view (mesh surfaces can be) have no splat before them
+        pz = means @ self.V[2, :3].astype(np.float32) + np.float32(self.V[2, 3])
+        seen = (pz > 1e-9) & (u >= 0) & (u < self.res) & (v >= 0) & (v < self.res)
         d = np.minimum(np.maximum(dist - bias, 0.0) / self.dmax, 0.9999)
         total = np.zeros(len(means), np.float64)
         taps = 0
@@ -185,57 +190,135 @@ class DeepShadow:
                                     (stop > start).astype(np.float64))
                     total += np.power(self.gpu_T[iv, iu], self.density * np.clip(frac, 0.0, 1.0))
                 taps += 1
-        return (total / taps).astype(np.float32)
+        return np.where(seen, total / taps, 1.0).astype(np.float32)
+
+
+def _blurred_log_T(T, softness):
+    logT = np.log(T)
+    if softness > 0:
+        k = 2 * softness + 1
+        for axis in (0, 1):                                              # separable box blur
+            c = np.cumsum(np.pad(logT, [(softness + 1, softness)] if axis == 0 else
+                                 [(0, 0), (softness + 1, softness)], mode='edge'), axis=axis)
+            logT = ((c[k:] - c[:-k]) if axis == 0 else (c[:, k:] - c[:, :-k])) / k
+    return logT
+
+
+def surface_visibility(sm, pts, bias, softness):
+    """Light reaching points on other surfaces (meshes) through the splats of map `sm`.
+
+    Like DeepShadow.visibility, but the coverage is read with bilinear filtering: a mesh
+    surface is continuous, and nearest-pixel reads show the shadow map's pixels as steps
+    where it meets the surface at a grazing angle."""
+    u, v, dist, _ = sm._project(pts)
+    pz = pts @ sm.V[2, :3].astype(np.float32) + np.float32(sm.V[2, 3])
+    res = sm.res
+    seen = (pz > 1e-9) & (u >= 0) & (u < res) & (v >= 0) & (v < res)
+    out = np.ones(len(pts), np.float32)
+    if sm.gpu_T is None or not np.any(seen):
+        return np.where(seen, sm.visibility(pts, bias, softness), 1.0).astype(np.float32)
+    u, v, dist = u[seen], v[seen], dist[seen]
+    logT = _blurred_log_T(sm.gpu_T, softness)
+    # share of each column's occlusion in front of the point (nearest column)
+    iu = np.clip(np.floor(u).astype(np.int64), 0, res - 1)
+    iv = np.clip(np.floor(v).astype(np.int64), 0, res - 1)
+    pix = (iv * res + iu).astype(np.float64)
+    d = np.minimum(np.maximum(dist - bias, 0.0) / sm.dmax, 0.9999)
+    start = np.searchsorted(sm.key, pix, side="left")
+    stop = np.searchsorted(sm.key, pix + d, side="left")
+    end = np.searchsorted(sm.key, pix + 1.0, side="left")
+    before = sm.cum[stop] - sm.cum[start]
+    whole = sm.cum[end] - sm.cum[start]
+    frac = np.where(whole < -1e-9, before / np.minimum(whole, -1e-9), 0.0)
+    empty = whole >= -1e-9
+    if np.any(empty) and sm.gpu_depth is not None:
+        # A column with no splats: its coverage is only the neighbours' blurred edge. Whether
+        # that edge is in front of the point: compare with the neighbours' mean depth.
+        r = softness + 1
+        k = 2 * r + 1
+        a = sm.gpu_alpha.astype(np.float64)
+        ad = a * sm.gpu_depth
+        def box(img):
+            for axis in (0, 1):
+                c = np.cumsum(np.pad(img, [(r + 1, r)] if axis == 0 else [(0, 0), (r + 1, r)],
+                                     mode='constant'), axis=axis)
+                img = (c[k:] - c[:-k]) if axis == 0 else (c[:, k:] - c[:, :-k])
+            return img
+        D = box(ad) / np.maximum(box(a), 1e-9)
+        de = dist[empty] - D[iv[empty], iu[empty]]
+        frac[empty] = np.clip(de / max(4.0 * float(np.max(bias)) if np.ndim(bias) else 4.0 * bias, 1e-9) + 0.5,
+                              0.0, 1.0)
+    # coverage, bilinear between pixel centres
+    x, y = u - 0.5, v - 0.5
+    x0 = np.clip(np.floor(x).astype(np.int64), 0, res - 1)
+    y0 = np.clip(np.floor(y).astype(np.int64), 0, res - 1)
+    x1, y1 = np.minimum(x0 + 1, res - 1), np.minimum(y0 + 1, res - 1)
+    fx, fy = np.clip(x - x0, 0, 1), np.clip(y - y0, 0, 1)
+    lt = (logT[y0, x0] * (1 - fx) * (1 - fy) + logT[y0, x1] * fx * (1 - fy) +
+          logT[y1, x0] * (1 - fx) * fy + logT[y1, x1] * fx * fy)
+    out[seen] = np.exp(sm.density * np.clip(frac, 0.0, 1.0) * lt)
+    return out
 
 
 def light_visibility(eye, target, corners, means, opacity, size, query, bias, res, softness,
-                     density=1.0):
+                     density=1.0, tris=None, extra=None, extra_bias=0.0):
     """Light reaching each `query` splat from a light at `eye` (deep opacity shadows).
 
     One map aimed at the model when it fits in a reasonable field of view; otherwise
-    (a light close to or inside the model) a cube of six maps around the light."""
-    V = look_at(eye, target)
-    pc = corners @ V[:3, :3].T + V[:3, 3]
-    if np.all(pc[:, 2] > 1e-9):
-        t = float(np.max(np.abs(pc[:, :2]) / pc[:, 2:3]))
-        if t < 1.6:                                  # under ~116 degrees: one map
-            sm = DeepShadow(V, (res / 2) / (t * 1.05), res, means, opacity, size)
-            sm.density = density
-            if query is means:
-                return sm.self_visibility(softness, bias)
-            return sm.visibility(query, bias, softness)
+    (a light close to or inside the model) a cube of six maps around the light.
+    tris: mesh triangles [T,3,3] that also block the light. extra: more points (mesh
+    surfaces) to find the splats' shadow at; then returns (vis, vis_extra)."""
+    from . import meshes
     eye = np.asarray(eye, np.float64)
-    rel_all = (means - eye).astype(np.float32)
-    rel_q = (query - eye).astype(np.float32)
-    face_q = np.argmax(np.abs(rel_q), axis=1) * 2 + (np.take_along_axis(
-        rel_q, np.argmax(np.abs(rel_q), axis=1)[:, None], 1)[:, 0] < 0)
     vis = np.ones(len(query), np.float32)
-    ups = [(0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 1, 0), (0, 1, 0)]
-    for axis in range(3):
-        for sign_i, sign in enumerate((1.0, -1.0)):
-            face = axis * 2 + sign_i
-            q = np.nonzero(face_q == face)[0]
-            if len(q) == 0:
-                continue
-            d = np.zeros(3); d[axis] = sign
-            Vf = look_at(eye, eye + d, ups[face])
-            # occluders: splats in front of this face, within its (slightly widened) view
-            pcs = rel_all @ Vf[:3, :3].T.astype(np.float32)
+    vis_x = None if extra is None else np.ones(len(extra), np.float32)
+    rel_all = face_all = face_q = face_x = None
+
+    def faces(pts):
+        rel = (pts - eye).astype(np.float32)
+        ax = np.argmax(np.abs(rel), axis=1)
+        return ax * 2 + (np.take_along_axis(rel, ax[:, None], 1)[:, 0] < 0)
+
+    for V, f_unit, fi in _face_views(eye, target, corners):
+        f = f_unit * res
+        if fi is None:
+            inside = slice(None)
+            q = np.arange(len(query))
+            xq = None if extra is None else np.arange(len(extra))
+        else:
+            if rel_all is None:
+                rel_all = (means - eye).astype(np.float32)
+                face_q = faces(query)
+                face_x = None if extra is None else faces(extra)
+            pcs = rel_all @ V[:3, :3].T.astype(np.float32)
             z = pcs[:, 2]
+            # occluders: splats in front of this face, within its (slightly widened) view
             inside = (z > 1e-9) & (np.abs(pcs[:, 0]) <= 1.05 * z) & (np.abs(pcs[:, 1]) <= 1.05 * z)
-            f = (res / 2) / 1.05
-            sm = DeepShadow(Vf, f, res, means[inside], opacity[inside], size[inside])
-            sm.density = density
-            if query is means:
+            q = np.nonzero(face_q == fi)[0]
+            xq = None if extra is None else np.nonzero(face_x == fi)[0]
+            if len(q) == 0 and (xq is None or len(xq) == 0):
+                continue
+        sm = DeepShadow(V, f, res, means[inside], opacity[inside], size[inside])
+        sm.density = density
+        if query is means:
+            if fi is None:
+                vis[:] = sm.self_visibility(softness, bias)
+            else:
                 pos = np.full(len(means), -1, np.int64)
                 pos[np.nonzero(inside)[0]] = np.arange(int(inside.sum()))
                 pq = pos[q]
                 ok = pq >= 0
                 v = sm.self_visibility(softness, bias[inside] if np.ndim(bias) else bias)
                 vis[q[ok]] = v[pq[ok]]
-            else:
-                vis[q] = sm.visibility(query[q], bias[q] if np.ndim(bias) else bias, softness)
-    return vis
+        elif len(q):
+            vis[q] = sm.visibility(query[q], bias[q] if np.ndim(bias) else bias, softness)
+        if tris is not None and len(q):
+            dmap = meshes.rasterize_distance(V, f, res, tris)
+            vis[q] *= meshes.mesh_visibility(dmap, V, f, res, query[q],
+                                             bias[q] if np.ndim(bias) else bias, softness)
+        if extra is not None and len(xq):
+            vis_x[xq] = surface_visibility(sm, extra[xq], extra_bias, softness)
+    return vis if extra is None else (vis, vis_x)
 
 
 def _face_views(eye, target, corners):
@@ -255,42 +338,68 @@ def _face_views(eye, target, corners):
             yield look_at(eye, np.asarray(eye, np.float64) + d, ups[axis * 2 + sign_i]), 0.5 / 1.05, axis * 2 + sign_i
 
 
-def quick_light_visibility(eye, target, corners, means, width, res, density=1.0):
+def quick_light_visibility(eye, target, corners, means, width, res, density=1.0, tris=None,
+                           bias=0.0, extra=None):
     """Cheap level-of-detail shadows for lights being moved: one render per view from the
     light gives coverage and the depth where coverage reaches 50%. A splat well behind that
     surface gets the column's coverage, one in front gets full light, blended across the fur
     (2*bias). No sorting, so it costs one projection of the splats."""
     eye = np.asarray(eye, np.float64)
     vis = np.ones(len(means), np.float32)
+    vis_x = None if extra is None else np.ones(len(extra), np.float32)
     rel = (means - eye).astype(np.float32)
-    face = None
-    for V, f_unit, fi in _face_views(eye, target, corners):
-        f = f_unit * res
-        if fi is not None:
-            if face is None:
-                ax = np.argmax(np.abs(rel), axis=1)
-                face = ax * 2 + (np.take_along_axis(rel, ax[:, None], 1)[:, 0] < 0)
-            q = np.nonzero(face == fi)[0]
-        else:
-            q = np.arange(len(means))
-        if len(q) == 0:
-            continue
-        _, alpha, _, median = native.render_ex(np.asarray(V, np.float32), f, f, res / 2, res / 2,
-                                               res, res, "3dgs")
-        pc = rel[q] @ V[:3, :3].T.astype(np.float32)
+    rel_x = None if extra is None else (extra - eye).astype(np.float32)
+    face = face_x = None
+
+    def faces(r):
+        ax = np.argmax(np.abs(r), axis=1)
+        return ax * 2 + (np.take_along_axis(r, ax[:, None], 1)[:, 0] < 0)
+
+    def lookup(r, alpha, median, V, f, w, outside_lit):
+        pc = r @ V[:3, :3].T.astype(np.float32)
         z = np.maximum(pc[:, 2], 1e-9)
-        iu = np.clip((f * pc[:, 0] / z + res / 2).astype(np.int64), 0, res - 1)
-        iv = np.clip((f * pc[:, 1] / z + res / 2).astype(np.int64), 0, res - 1)
+        u = f * pc[:, 0] / z + res / 2
+        v = f * pc[:, 1] / z + res / 2
+        iu = np.clip(u.astype(np.int64), 0, res - 1)
+        iv = np.clip(v.astype(np.int64), 0, res - 1)
         dist = np.linalg.norm(pc, axis=1)
         a = alpha[iv, iu]
         med = np.where(a > 0.5, median[iv, iu], np.inf)
-        w = np.asarray(width)[q] if np.ndim(width) else width
         # light is 50% at the median depth by definition, fades from full in front of it,
         # and can't fall below what gets through the whole column
         T_d = np.exp(-math.log(2.0) * np.exp(np.clip((dist - med) / np.maximum(w, 1e-12), -30, 30)))
         T_floor = np.power(np.clip(1.0 - a, 1e-6, 1.0), density)
-        vis[q] = np.maximum(T_d, T_floor)
-    return vis
+        out = np.maximum(T_d, T_floor)
+        if outside_lit:
+            out = np.where((pc[:, 2] > 1e-9) & (u >= 0) & (u < res) & (v >= 0) & (v < res), out, 1.0)
+        return out
+
+    for V, f_unit, fi in _face_views(eye, target, corners):
+        f = f_unit * res
+        if fi is not None:
+            if face is None:
+                face = faces(rel)
+                face_x = None if extra is None else faces(rel_x)
+            q = np.nonzero(face == fi)[0]
+            xq = None if extra is None else np.nonzero(face_x == fi)[0]
+        else:
+            q = np.arange(len(means))
+            xq = None if extra is None else np.arange(len(extra))
+        if len(q) == 0 and (xq is None or len(xq) == 0):
+            continue
+        _, alpha, _, median = native.render_ex(np.asarray(V, np.float32), f, f, res / 2, res / 2,
+                                               res, res, "3dgs")
+        w = np.asarray(width)[q] if np.ndim(width) else width
+        vis[q] = lookup(rel[q], alpha, median, V, f, w, False)
+        if extra is not None and len(xq):
+            vis_x[xq] = lookup(rel_x[xq], alpha, median, V, f,
+                               float(np.median(width)) if np.ndim(width) else width, True)
+        if tris is not None:
+            from . import meshes
+            dmap = meshes.rasterize_distance(V, f, res, tris)
+            vis[q] *= meshes.mesh_visibility(dmap, V, f, res, means[q],
+                                             bias[q] if np.ndim(bias) else bias, 0)
+    return vis if extra is None else (vis, vis_x)
 
 
 class Relighter:
@@ -354,24 +463,40 @@ class Relighter:
             c = self.c + np.einsum('nkc,nk->nc', self.b1, basis)
         return np.maximum(c, 0.0)
 
+    mesh_tris = None           # world triangles that also cast shadows (set by the engine)
+    mesh_points = None         # mesh surface points to find the splats' shadow at
+    mesh_vis = None            # -> light name: light reaching each mesh point (after colours())
+
     def _shadow(self, eye, shadows, shadow_res, softness, report, name):
         if not shadows:
+            if self.mesh_points is not None:
+                self.mesh_vis[name] = np.ones(len(self.mesh_points), np.float32)
             return 1.0
-        return light_visibility(eye, self.centre, self.corners, self.means, self.opacity,
-                                self.occluder_size, self.means, 2.0 * self.splat_size,
-                                shadow_res, softness, self.shadow_density)
+        out = light_visibility(eye, self.centre, self.corners, self.means, self.opacity,
+                               self.occluder_size, self.means, 2.0 * self.splat_size,
+                               shadow_res, softness, self.shadow_density, self.mesh_tris,
+                               self.mesh_points, 0.004 * self.extent)
+        if self.mesh_points is None:
+            return out
+        self.mesh_vis[name] = out[1]
+        return out[0]
 
     def quick_dc(self, lights, cam_pos, ambient, exposure, shadows=False, shadow_res=512):
         """Fast base-colour relight for dragging lights: diffuse only, no shadows, no SH,
         mixed in display space (an approximation the full pass replaces)."""
         out = self.c * np.float32(ambient ** (1 / 2.2))
         gain = 2.0 ** exposure
+        self.mesh_vis = {}
         for L in lights:
             ldirs, e, eye, _ = self._light_terms(L, gain)
             if shadows:
-                e = e * quick_light_visibility(eye, self.centre, self.corners, self.means,
-                                               self.quick_width * self.extent, shadow_res,
-                                               self.shadow_density)
+                v = quick_light_visibility(eye, self.centre, self.corners, self.means,
+                                           self.quick_width * self.extent, shadow_res,
+                                           self.shadow_density, self.mesh_tris,
+                                           2.0 * self.splat_size, self.mesh_points)
+                if self.mesh_points is not None:
+                    v, self.mesh_vis[L["name"]] = v
+                e = e * v
             w = np.power(e, np.float32(1 / 2.2))[:, None] * \
                 np.asarray(L["colour"], np.float32)[None, :]
             out = out + self.diffuse_at(-ldirs) * w
@@ -396,6 +521,26 @@ class Relighter:
         k = np.float32(self.shine_colour)
         return Ls[:, None] * ((1 - k) + k * chroma)
 
+    last_vis = {}
+
+    def diffuse_dc(self, lights, ambient, exposure):
+        """The last colours() relight without its view-dependent parts (shine, captured view
+        colour), reusing its shadows: for views from elsewhere, such as reflections."""
+        gain = 2.0 ** exposure
+        lin = self.albedo_lin * ambient
+        for L in lights:
+            ldirs, e, _, _ = self._light_terms(L, gain)
+            vis = np.broadcast_to(np.asarray(self.last_vis.get(L["name"], 1.0), np.float32), e.shape)
+            w = (e * vis)[:, None] * np.asarray(L["colour"], np.float32)[None, :]
+            # Reflections mostly see sides the capture never looked at (undersides), where
+            # band 1 extrapolates to false colours: keep the splat's own colour, take only
+            # the brightness from the light's direction.
+            full = self.diffuse_at(-ldirs)
+            lum_w = np.array([0.2126, 0.7152, 0.0722], np.float32)
+            k = (full @ lum_w) / np.maximum(self.c @ lum_w, 1e-3)
+            lin = lin + srgb_to_linear(np.maximum(self.c, 0.0) * np.clip(k, 0.0, 4.0)[:, None]) * w
+        return ((np.maximum(linear_to_srgb(lin), 0.0) - 0.5) / C0).astype(np.float32)
+
     def sh_at(self, dirs, first, last):
         """Sum of SH coefficients first..last-1 (indices into the higher bands) at dirs [N,3]."""
         B = sh_basis(dirs, self.sh0.shape[1])[:, 1 + first:1 + last]          # [N, k]
@@ -416,6 +561,8 @@ class Relighter:
         ambient : a share of the scan exactly as captured (all bands, seen from the camera).
         With one light at the camera and no ambient this gives back the scan."""
         gain = 2.0 ** exposure
+        self.mesh_vis = {}
+        self.last_vis = {}
         # 3DGS reads SH at the camera->splat direction.
         v = (self.means - cam_pos[None, :]).astype(np.float32)
         v /= np.maximum(np.linalg.norm(v, axis=1, keepdims=True), 1e-12)
@@ -427,6 +574,7 @@ class Relighter:
         for L in lights:
             ldirs, e, eye, _ = self._light_terms(L, gain)
             vis = self._shadow(eye, shadows, shadow_res, softness, report, L["name"])
+            self.last_vis[L["name"]] = vis
             col = np.asarray(L["colour"], np.float32)[None, :]
             vis = np.broadcast_to(np.asarray(vis, np.float32), e.shape)
             w = (e * vis)[:, None] * col
