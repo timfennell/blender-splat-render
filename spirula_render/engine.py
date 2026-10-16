@@ -20,6 +20,7 @@ _CACHE = {"key": None, "colour_key": None}
 # the mesh surface points (one per pixel) the splats' shadows are wanted at.
 _MESH = {"tris": None, "points": None, "serial": 0, "mirrors": None}
 _SERIAL = itertools.count(1)
+_LAST_FRAME = {}        # the last finished final render, shown while the next frame renders
 
 
 def _splat_key(obj):
@@ -411,6 +412,10 @@ class SpirulaRenderEngine(bpy.types.RenderEngine):
         film_transparent = meshes.original_film_transparent(scene)
         world = tuple(scene.world.color)[:3] if scene.world else (0.05, 0.05, 0.05)
         frozen = _freeze(depsgraph)
+        # Show the previous frame's finished image until this one is ready.
+        last = _LAST_FRAME.get("args")
+        if last is not None and _LAST_FRAME.get("size") == (W, H):
+            self._write(*last, remember=False)
         tris = None
         mirrors = []
         if getattr(self, "session", None):
@@ -426,8 +431,15 @@ class SpirulaRenderEngine(bpy.types.RenderEngine):
         mesh = None
         if P is not None:
             mesh = self._mesh_layer(P, tris, settings, ray)
+        # With nothing to show yet (first frame), or after Cycles has drawn its mesh-only
+        # progress over the window: a quick look with the colours already on the GPU.
+        if last is None or _LAST_FRAME.get("size") != (W, H) or mesh is not None:
+            self._quick_look(frozen, settings, cam_world, fx, fy, cx, cy, W, H, mesh, ray,
+                             film_transparent, world)
+        if self.test_break():
+            return
         t0 = time.time()
-        self.update_stats("", "Spirula: rendering")
+        self.update_stats("", "Spirula: relighting and rendering")
         out = _render_view(frozen, settings, cam_world,
                            lambda: sd.view_matrix(cam_world, _IDENTITY),
                            fx, fy, cx, cy, W, H, lambda m: self.report({'WARNING'}, m),
@@ -453,6 +465,37 @@ class SpirulaRenderEngine(bpy.types.RenderEngine):
         rgba = np.concatenate([rgb, alpha[..., None]], -1)
         if mesh is not None:
             rgba, depth = self._composite(rgba, depth, mesh, mesh_vis, settings)
+        self._write(rgba, depth, ray, film_transparent, world, W, H, remember=True)
+
+    def _quick_look(self, *args):
+        try:
+            self._preview(*args)
+        except native.RenderError as e:
+            print("Spirula preview:", e)
+
+    def _preview(self, frozen, settings, cam_world, fx, fy, cx, cy, W, H, mesh, ray,
+                 film_transparent, world):
+        splats = _splat_objects(frozen)
+        if not splats:
+            return
+        self.update_stats("", "Spirula: preview")
+        with _LOCK:
+            _upload_scene(splats, lambda m: None)
+            if not settings.use_relight:
+                _ensure_colours(frozen, None, cam_world, settings, lambda m: None)
+            rgb, alpha, d = native.render(sd.view_matrix(cam_world, _IDENTITY), fx, fy, cx, cy,
+                                          W, H, settings.primitive)
+        rgb = _to_linear(rgb, alpha, settings)
+        rgba = np.concatenate([rgb, alpha[..., None]], -1)
+        depth = np.where(alpha > 1e-3, d, np.inf).astype(np.float32)
+        if mesh is not None:
+            rgba, depth = self._composite(rgba, depth, mesh, None, settings)
+        self._write(rgba, depth, ray, film_transparent, world, W, H)
+
+    def _write(self, rgba, depth, ray, film_transparent, world, W, H, remember=False):
+        if remember:
+            _LAST_FRAME.update(size=(W, H), args=(rgba, depth, ray, film_transparent, world, W, H))
+        rgba = rgba.copy()
         if not film_transparent:
             bg = np.array(world, np.float32)
             rgba[..., :3] += bg * (1 - rgba[..., 3:4])
