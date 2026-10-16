@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "spirula_render"
-version = "0.7.0"
+version = "0.7.1"
 name = "Spirula Render"
 tagline = "Render 3D Gaussian splats with Spirula Studio's own renderer"
 maintainer = "Tim Fennell"

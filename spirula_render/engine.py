@@ -499,6 +499,7 @@ class SpirulaRenderEngine(bpy.types.RenderEngine):
         pos, cov = mesh["pos"], mesh["covered"]
         extent = _CACHE["relighter"].extent if _CACHE.get("relighter") is not None else 1.0
         total = np.zeros((H, W, 3), np.float32)
+        cover = np.zeros((H, W), np.float32)
         for n, off, rough, name in mirrors:
             on = cov & (np.abs(pos @ np.asarray(n, np.float32) - off) < 1e-4 * max(extent, 1e-3) + 1e-6)
             on &= gc.max(-1) > 1e-3
@@ -506,11 +507,16 @@ class SpirulaRenderEngine(bpy.types.RenderEngine):
                 continue
             t = time.time()
             self.update_stats("", f"Spirula: reflection in {name}")
-            rgb, _ = _render_mirror(n, off, cam_world, fx, fy, cx, cy, W, H, settings, lights)
-            rgb = _blur(rgb, (1.0 + 60.0 * rough * rough) * W / 1920.0)
+            rgb, alpha = _render_mirror(n, off, cam_world, fx, fy, cx, cy, W, H, settings, lights)
+            sigma = (1.0 + 60.0 * rough * rough) * W / 1920.0
+            rgb, alpha = _blur(rgb, sigma), _blur(alpha[..., None], sigma)[..., 0]
             total[on] += gc[on] * rgb[on]
+            # the reflected splats hide what Cycles saw behind them in the reflection: as
+            # much of it as the surface's reflection makes up (all of it in a mirror)
+            share = np.clip(gc[on] @ np.array([0.2126, 0.7152, 0.0722], np.float32), 0.0, 1.0)
+            cover[on] = np.maximum(cover[on], share * alpha[on])
             print(f"Spirula: reflection in '{name}' in {time.time() - t:.2f}s")
-        return total
+        return total, cover
 
     def _composite(self, rgba, depth, mesh, mesh_vis, settings):
         """Splats and meshes, per pixel by depth. Meshes are relit in this engine's units with
@@ -537,7 +543,8 @@ class SpirulaRenderEngine(bpy.types.RenderEngine):
                 lit += np.float32(settings.ambient) * mesh["albedo"][..., :3]
             M[..., :3] = lit
         if mesh.get("reflection") is not None:
-            M[..., :3] += mesh["reflection"]
+            add, cover = mesh["reflection"]
+            M[..., :3] = M[..., :3] * (1 - cover[..., None]) + add
         S = rgba
         aS, aM = S[..., 3:4], M[..., 3:4]
         s_over = S + (1 - aS) * M

@@ -20,7 +20,18 @@ other.
 
 ## Meshes alongside the splats
 
-![Two bee scans on a glossy floor: shadows on the floor, reflections in it, labels and a scale bar](docs/bees_on_glossy_floor.jpg)
+![Two bee scans with a mirror, a glossy floor, three metal slats and a red ball: shadows and reflections between them](docs/shadows_and_reflections.jpg)
+
+One final render, one point light at the front left:
+
+- **Meshes shadow splats:** the three slats cast stripes across the left bee's fur.
+- **Splats shadow meshes:** both bees cast soft fur shadows across the floor.
+- **Splats shadow splats:** the left bee shades the right one, and each shades itself.
+- **Splats in a mirror:** the mirror shows the bees' backs, a side the camera can't see.
+- **Splats in a glossy floor:** the bees are reflected, blurred by the floor's roughness.
+- **Meshes in meshes (Cycles):** the ball, slats and frame are reflected in the floor and the mirror.
+
+![Two bee scans on a glossy floor with labels and a scale bar drawn on top](docs/bees_on_glossy_floor.jpg)
 
 Polygon objects (planes, text, rulers, frames, any mesh) render with the splats. In final renders
 they're path traced by Blender's own Cycles, run inside this engine, so their materials, textures
