@@ -1,6 +1,6 @@
 """Load the renderer library outside Blender and render a small cloud of splats.
 
-    python tools/smoke_test.py path/to/lib/dir
+    python tools/smoke_test.py path/to/libspirula_render.so   (or .dylib / .dll, or a folder holding it)
 
 Checks that the library loads, takes splats, renders something, updates colours and returns
 the median depth -- on any Vulkan device, including a software one (Mesa lavapipe) on CI.
@@ -18,9 +18,12 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 def main():
-    lib_dir = os.path.abspath(sys.argv[1])
+    src = os.path.abspath(sys.argv[1])
     tmp = tempfile.mkdtemp()
-    shutil.copytree(lib_dir, os.path.join(tmp, "lib"))
+    os.makedirs(os.path.join(tmp, "lib"))
+    if os.path.isdir(src):
+        src = next(os.path.join(src, f) for f in os.listdir(src) if "spirula_render" in f)
+    shutil.copy(src, os.path.join(tmp, "lib"))
     shutil.copy(os.path.join(HERE, "..", "spirula_render", "native.py"), tmp)
     spec = importlib.util.spec_from_file_location("native", os.path.join(tmp, "native.py"))
     native = importlib.util.module_from_spec(spec)

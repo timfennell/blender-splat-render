@@ -14,25 +14,58 @@ camera. Splats erased with the Gaussian Splat Patch add-on are left out.
 
 Status: early. Final renders and the viewport's Rendered mode (perspective, orthographic and camera
 view; renders at half resolution by default). Any number of splat objects (merged per frame in world
-space, so they overlap and shadow each other), perspective scene cameras, macOS (Apple Silicon).
+space, so they overlap and shadow each other), perspective scene cameras. macOS on Apple Silicon is
+tested; Windows and Linux builds are experimental (see [Platforms](#platforms)).
 With **Relight** on, the scene's lights light the splats, and the splats shadow themselves and each
 other.
 
+## Install
+
+You need **Blender 5.3 or newer** and one of:
+
+| System | Download | Status |
+|---|---|---|
+| macOS, Apple Silicon (M1 or later) | `spirula_render-<version>-macos-arm64.zip` | Tested |
+| Windows 10/11, 64-bit, with a Vulkan GPU driver | `spirula_render-<version>-windows-x64.zip` | Experimental |
+| Linux, 64-bit, with a Vulkan GPU driver | `spirula_render-<version>-linux-x64.zip` | Experimental |
+
+1. Open the [latest release](https://github.com/timfennell/blender-splat-render/releases/latest) and
+   download the zip for your system. Don't unzip it.
+2. In Blender: **Edit > Preferences > Get Extensions**, open the **⌄** menu at the top right, choose
+   **Install from Disk...** and pick the zip. (Dragging the zip onto the Blender window works too.)
+   It's enabled straight away.
+3. In **Render Properties**, set **Render Engine** to **Spirula (3DGS)**.
+4. Import a splat model: **File > Import > Stanford PLY (.ply)** reads 3DGS PLY files (as exported
+   by trainers such as Spirula Studio, Brush or SuperSplat) as point clouds.
+5. Add a camera if the scene has none and press **F12**, or switch a 3D viewport to **Rendered**
+   shading.
+
+To **update**, install the newer zip the same way; it replaces the old version (restart Blender
+afterwards, since the renderer library stays loaded). To **remove** it: **Preferences > Add-ons >
+Spirula Render > ⌄ > Uninstall**.
+
+**If it doesn't work:**
+
+- *"The renderer library is missing"*: the zip is for another system; download the one for yours.
+- Windows/Linux: the renderer needs a Vulkan GPU driver (any current NVIDIA, AMD or Intel driver
+  has one; `vulkaninfo` from the Vulkan SDK shows it). Please
+  [open an issue](https://github.com/timfennell/blender-splat-render/issues) with what you see:
+  those builds haven't been tried on a real Windows or Linux machine yet.
+- Meshes in a scene are rendered through Blender's own Cycles, which must stay enabled (it is
+  by default).
+
 ## Platforms
 
-**macOS on Apple Silicon only, for now.** The add-on ships one compiled library,
-`libspirula_render.dylib`, built for arm64 macOS with MoltenVK linked in; Blender won't install the
-extension on other systems (its manifest lists only `macos-arm64`).
+The renderer is Spirula Studio's, as a library with a small C interface; the rest of the add-on is
+Python and Blender's own GPU API, the same on every system. Each release has one zip per system,
+built on GitHub Actions from upstream Spirula Studio plus the patch in `spirula_patch/`:
 
-Nothing in the approach is Mac-specific. Spirula Studio's renderer runs on Windows and Linux too
-(Vulkan on NVIDIA, AMD and Intel GPUs), and the rest of the add-on is Python and Blender's own GPU
-API. A port needs:
+- **macOS (Apple Silicon):** MoltenVK linked in. Tested on an M2 Pro.
+- **Linux (x64):** built and tested on GitHub's runners with a software Vulkan device (Mesa
+  lavapipe), which checks it renders correctly, not how it runs on a real GPU.
+- **Windows (x64):** built on GitHub's runners and checked to load; not yet run on a real machine.
 
-- the `spirula_render` library built on each system: the macOS-only linker flag that limits its
-  exports becomes a version script on Linux and `dllexport` on Windows;
-- the add-on loading `libspirula_render.so` / `spirula_render.dll` by platform;
-- one release zip per platform;
-- testing on real Windows and Linux machines with a GPU.
+Reports from Windows and Linux users are very welcome.
 
 ## Depth of field
 
@@ -96,11 +129,24 @@ The renderer library is built from a branch of Spirula Studio (`blender-render`,
 
 ## Building the renderer library
 
-`spirula_render/lib/libspirula_render.dylib` (shipped in the release zip) is built from
+The library in each release zip is built from
 [Spirula Studio](https://github.com/harry7557558/spirula-studio) (GPL-3.0) at the upstream commit in
 `spirula_patch/UPSTREAM_BASE.txt`, plus `spirula_patch/spirula-local-changes.patch` (which adds the C
-interface `src/blender/SplatRenderC.cpp` and the `spirula_render` CMake target). Build with
-`ninja spirula_render` in a Vulkan (MoltenVK) build of that tree, then copy the dylib into
-`spirula_render/lib/` and run `blender --command extension build --source-dir spirula_render`.
+interface `src/blender/SplatRenderC.cpp` and the `spirula_render` CMake target).
+`.github/workflows/build.yml` does this on every tag for all three systems. By hand, with the
+Vulkan SDK (Windows, Linux) or Xcode tools (macOS), CMake and Ninja:
+
+```bash
+git clone https://github.com/harry7557558/spirula-studio spirula && cd spirula
+git checkout "$(cat ../spirula_patch/UPSTREAM_BASE.txt)"
+git apply ../spirula_patch/spirula-local-changes.patch
+cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release -DSS_BACKEND=vulkan -DSS_ENABLE_PATENTED=ON
+cmake --build build --target spirula_render
+cd .. && python tools/smoke_test.py spirula/build/libspirula_render.so   # optional test render
+python tools/package.py --lib spirula/build/libspirula_render.so --platform linux-x64
+```
+
+(On Windows the library is `spirula/build/spirula_render.dll` and the platform `windows-x64`, built
+from a Visual Studio developer prompt; on macOS `libspirula_render.dylib` and `macos-arm64`.)
 
 License: GPL-3.0-or-later.
