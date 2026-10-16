@@ -140,7 +140,7 @@ Vulkan SDK (Windows, Linux) or Xcode tools (macOS), CMake and Ninja:
 git clone https://github.com/harry7557558/spirula-studio spirula && cd spirula
 git checkout "$(cat ../spirula_patch/UPSTREAM_BASE.txt)"
 git apply ../spirula_patch/spirula-local-changes.patch
-cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release -DSS_BACKEND=vulkan -DSS_ENABLE_PATENTED=ON
+cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DSS_BACKEND=vulkan -DSS_ENABLE_PATENTED=ON
 cmake --build build --target spirula_render
 cd .. && python tools/smoke_test.py spirula/build/libspirula_render.so   # optional test render
 python tools/package.py --lib spirula/build/libspirula_render.so --platform linux-x64

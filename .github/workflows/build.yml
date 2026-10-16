@@ -85,7 +85,7 @@ jobs:
         shell: bash
         working-directory: spirula
         run: |
-          cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release -DSS_BACKEND=vulkan -DSS_ENABLE_PATENTED=ON
+          cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DSS_BACKEND=vulkan -DSS_ENABLE_PATENTED=ON
           cmake --build build --target spirula_render
 
       - name: Collect
