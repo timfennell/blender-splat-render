@@ -59,13 +59,20 @@ int guarded(F&& f) {
 
 }  // namespace
 
+// Only these functions leave the library (the engine and backend inside stay private).
+#if defined(_WIN32)
+#define SR_API __declspec(dllexport)
+#else
+#define SR_API __attribute__((visibility("default")))
+#endif
+
 extern "C" {
 
-const char* sr_last_error() { return g_error.c_str(); }
+SR_API const char* sr_last_error() { return g_error.c_str(); }
 
 // Load (or replace) the splats. A fresh world each time: the engine's
 // set_data_3dgs is a no-op on an initialised world.
-int sr_set_splats(int64_t num, int sh_degree, const float* means, const float* quats,
+SR_API int sr_set_splats(int64_t num, int sh_degree, const float* means, const float* quats,
                   const float* scales, const float* opacities, const float* features_dc,
                   const float* features_sh) {
     return guarded([&] {
@@ -82,7 +89,7 @@ int sr_set_splats(int64_t num, int sh_degree, const float* means, const float* q
 
 // Render one pinhole view. out_rgb [H*W*3], out_alpha / out_depth [H*W] may be null.
 // primitive: "3dgs" (classic EWA splatting, what most trainers use), "mip", "3dgut".
-int sr_render(const float* viewmat, float fx, float fy, float cx, float cy, int width,
+SR_API int sr_render(const float* viewmat, float fx, float fy, float cx, float cy, int width,
               int height, const char* primitive, float* out_rgb, float* out_alpha,
               float* out_depth) {
     return guarded([&] {
@@ -108,7 +115,7 @@ int sr_render(const float* viewmat, float fx, float fy, float cx, float cy, int 
 
 // Replace the splats' colours in place (same count and SH degree as loaded):
 // what relighting changes every frame, without re-uploading the geometry.
-int sr_set_colors(const float* features_dc, const float* features_sh) {
+SR_API int sr_set_colors(const float* features_dc, const float* features_sh) {
     return guarded([&] {
         if (g_num <= 0) throw std::runtime_error("no splats loaded");
         auto& w = engine().world;
@@ -127,7 +134,7 @@ int sr_set_colors(const float* features_dc, const float* features_sh) {
 
 // sr_render plus the per-pixel median depth (where coverage reaches 50%): the
 // surface depth a shadow map wants. out_median [H*W] may be null.
-int sr_render_ex(const float* viewmat, float fx, float fy, float cx, float cy, int width,
+SR_API int sr_render_ex(const float* viewmat, float fx, float fy, float cx, float cy, int width,
                  int height, const char* primitive, float* out_rgb, float* out_alpha,
                  float* out_depth, float* out_median) {
     return guarded([&] {
@@ -153,8 +160,8 @@ int sr_render_ex(const float* viewmat, float fx, float fy, float cx, float cy, i
 
 // Render with at most this many SH bands (0 = base colour only, which is what a
 // fast interactive relight updates); -1 restores all loaded bands.
-void sr_set_render_degree(int degree) { g_render_degree = degree; }
+SR_API void sr_set_render_degree(int degree) { g_render_degree = degree; }
 
-void sr_shutdown() { engine_reset(); g_num = 0; }
+SR_API void sr_shutdown() { engine_reset(); g_num = 0; }
 
 }  // extern "C"

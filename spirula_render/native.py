@@ -17,11 +17,30 @@ class RenderError(RuntimeError):
     pass
 
 
+LIB_NAMES = {"darwin": "libspirula_render.dylib", "linux": "libspirula_render.so",
+             "win32": "spirula_render.dll"}
+
+
+def library_path():
+    """The renderer library for this system, shipped in lib/ (one per platform build)."""
+    import sys
+    here = os.path.join(os.path.dirname(__file__), "lib")
+    name = LIB_NAMES.get(sys.platform)
+    if name is None:
+        raise RenderError(f"Spirula Render has no renderer library for {sys.platform}")
+    path = os.path.join(here, name)
+    if not os.path.exists(path):
+        raise RenderError(f"The renderer library is missing ({path}). Install the release zip "
+                          "made for this system (macOS, Windows or Linux).")
+    if sys.platform == "win32":
+        os.add_dll_directory(here)            # anything shipped beside it
+    return path
+
+
 def lib():
     global _LIB
     if _LIB is None:
-        path = os.path.join(os.path.dirname(__file__), "lib", "libspirula_render.dylib")
-        L = ctypes.CDLL(path)
+        L = ctypes.CDLL(library_path())
         L.sr_last_error.restype = ctypes.c_char_p
         L.sr_set_splats.argtypes = [ctypes.c_int64, ctypes.c_int] + [_FP] * 6
         L.sr_set_splats.restype = ctypes.c_int

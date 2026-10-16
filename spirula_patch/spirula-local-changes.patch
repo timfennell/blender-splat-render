@@ -1,13 +1,15 @@
 diff --git a/cmake/SsBackendVulkan.cmake b/cmake/SsBackendVulkan.cmake
-index d4086b7b..88c84555 100644
+index d4086b7b..93cd15bb 100644
 --- a/cmake/SsBackendVulkan.cmake
 +++ b/cmake/SsBackendVulkan.cmake
-@@ -113,6 +113,18 @@ foreach(test_src ${SS_ENGINE_TESTS})
+@@ -113,6 +113,29 @@ foreach(test_src ${SS_ENGINE_TESTS})
          $<$<COMPILE_LANGUAGE:CXX>:${SPLAT_CXX_FLAGS}>)
  endforeach()
  
 +# The renderer as a shared library with a C interface, for the Blender render
 +# engine add-on (loaded with ctypes). MoltenVK is static, so it is self-contained.
++# (its parts must be position-independent to link into a shared library on Linux)
++set_target_properties(csrc_portable ss_backend_vulkan PROPERTIES POSITION_INDEPENDENT_CODE ON)
 +add_library(spirula_render SHARED ${SS_SRC}/blender/SplatRenderC.cpp)
 +target_link_libraries(spirula_render PRIVATE csrc_portable ss_backend_vulkan
 +    Threads::Threads)
@@ -15,8 +17,17 @@ index d4086b7b..88c84555 100644
 +    $<$<COMPILE_LANGUAGE:CXX>:${SPLAT_CXX_FLAGS}>)
 +# Export only the C interface: the static MoltenVK and engine inside must not
 +# clash with the host process's own symbols (Blender links graphics code too).
-+target_link_options(spirula_render PRIVATE
-+    "LINKER:-exported_symbols_list,${SS_SRC}/blender/exports.txt")
++# Windows exports only what SR_API marks.
++set_target_properties(spirula_render PROPERTIES CXX_VISIBILITY_PRESET hidden
++    C_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN ON)
++if(APPLE)
++    target_link_options(spirula_render PRIVATE
++        "LINKER:-exported_symbols_list,${SS_SRC}/blender/exports.txt")
++elseif(UNIX)
++    target_link_options(spirula_render PRIVATE
++        "LINKER:--version-script=${SS_SRC}/blender/exports.map"
++        "LINKER:--exclude-libs,ALL")
++endif()
 +
  # The app targets build against the
  # portable engine + Vulkan backend instead.
@@ -2652,10 +2663,10 @@ index 16a25dd5..40378811 100644
              float2 delta = float2(f.xy.x - px, f.xy.y - py);
 diff --git a/src/blender/SplatRenderC.cpp b/src/blender/SplatRenderC.cpp
 new file mode 100644
-index 00000000..5aa07a47
+index 00000000..678744d5
 --- /dev/null
 +++ b/src/blender/SplatRenderC.cpp
-@@ -0,0 +1,160 @@
+@@ -0,0 +1,167 @@
 +// A C interface to Spirula's 3DGS renderer, for loading into another process
 +// (the Blender render engine add-on calls it through ctypes).
 +//
@@ -2717,13 +2728,20 @@ index 00000000..5aa07a47
 +
 +}  // namespace
 +
++// Only these functions leave the library (the engine and backend inside stay private).
++#if defined(_WIN32)
++#define SR_API __declspec(dllexport)
++#else
++#define SR_API __attribute__((visibility("default")))
++#endif
++
 +extern "C" {
 +
-+const char* sr_last_error() { return g_error.c_str(); }
++SR_API const char* sr_last_error() { return g_error.c_str(); }
 +
 +// Load (or replace) the splats. A fresh world each time: the engine's
 +// set_data_3dgs is a no-op on an initialised world.
-+int sr_set_splats(int64_t num, int sh_degree, const float* means, const float* quats,
++SR_API int sr_set_splats(int64_t num, int sh_degree, const float* means, const float* quats,
 +                  const float* scales, const float* opacities, const float* features_dc,
 +                  const float* features_sh) {
 +    return guarded([&] {
@@ -2740,7 +2758,7 @@ index 00000000..5aa07a47
 +
 +// Render one pinhole view. out_rgb [H*W*3], out_alpha / out_depth [H*W] may be null.
 +// primitive: "3dgs" (classic EWA splatting, what most trainers use), "mip", "3dgut".
-+int sr_render(const float* viewmat, float fx, float fy, float cx, float cy, int width,
++SR_API int sr_render(const float* viewmat, float fx, float fy, float cx, float cy, int width,
 +              int height, const char* primitive, float* out_rgb, float* out_alpha,
 +              float* out_depth) {
 +    return guarded([&] {
@@ -2766,7 +2784,7 @@ index 00000000..5aa07a47
 +
 +// Replace the splats' colours in place (same count and SH degree as loaded):
 +// what relighting changes every frame, without re-uploading the geometry.
-+int sr_set_colors(const float* features_dc, const float* features_sh) {
++SR_API int sr_set_colors(const float* features_dc, const float* features_sh) {
 +    return guarded([&] {
 +        if (g_num <= 0) throw std::runtime_error("no splats loaded");
 +        auto& w = engine().world;
@@ -2785,7 +2803,7 @@ index 00000000..5aa07a47
 +
 +// sr_render plus the per-pixel median depth (where coverage reaches 50%): the
 +// surface depth a shadow map wants. out_median [H*W] may be null.
-+int sr_render_ex(const float* viewmat, float fx, float fy, float cx, float cy, int width,
++SR_API int sr_render_ex(const float* viewmat, float fx, float fy, float cx, float cy, int width,
 +                 int height, const char* primitive, float* out_rgb, float* out_alpha,
 +                 float* out_depth, float* out_median) {
 +    return guarded([&] {
@@ -2811,11 +2829,21 @@ index 00000000..5aa07a47
 +
 +// Render with at most this many SH bands (0 = base colour only, which is what a
 +// fast interactive relight updates); -1 restores all loaded bands.
-+void sr_set_render_degree(int degree) { g_render_degree = degree; }
++SR_API void sr_set_render_degree(int degree) { g_render_degree = degree; }
 +
-+void sr_shutdown() { engine_reset(); g_num = 0; }
++SR_API void sr_shutdown() { engine_reset(); g_num = 0; }
 +
 +}  // extern "C"
+diff --git a/src/blender/exports.map b/src/blender/exports.map
+new file mode 100644
+index 00000000..c26317d3
+--- /dev/null
++++ b/src/blender/exports.map
+@@ -0,0 +1,4 @@
++{
++  global: sr_*;
++  local: *;
++};
 diff --git a/src/blender/exports.txt b/src/blender/exports.txt
 new file mode 100644
 index 00000000..5b876c3b

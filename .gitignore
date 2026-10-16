@@ -1,3 +1,5 @@
 dist/
 __pycache__/
 spirula_render/lib/*.dylib
+spirula_render/lib/*.so
+spirula_render/lib/*.dll

@@ -1,0 +1,157 @@
+name: Build
+
+# Builds the renderer library (Spirula Studio at the commit in spirula_patch/UPSTREAM_BASE.txt,
+# plus spirula_patch/spirula-local-changes.patch) on each platform, tests it, and packages one
+# extension zip per platform. Tags v* attach the zips to that release.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            platform: linux-x64
+            lib: build/libspirula_render.so
+          - os: windows-2025
+            platform: windows-x64
+            lib: build/spirula_render.dll
+          - os: macos-15
+            platform: macos-arm64
+            lib: build/libspirula_render.dylib
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Spirula Studio source, patched
+        shell: bash
+        run: |
+          git clone --quiet https://github.com/harry7557558/spirula-studio spirula
+          cd spirula
+          git checkout --quiet "$(cat ../spirula_patch/UPSTREAM_BASE.txt)"
+          git apply ../spirula_patch/spirula-local-changes.patch
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Tools
+        shell: bash
+        run: python -m pip install --quiet ninja numpy
+
+      - name: Dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvulkan-dev mesa-vulkan-drivers spirv-tools libgl1-mesa-dev xorg-dev \
+            libwayland-dev libwayland-bin wayland-protocols libxkbcommon-dev libxrandr-dev \
+            libxinerama-dev libxcursor-dev libxi-dev
+
+      - name: Dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install libomp
+
+      - name: Vulkan SDK (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          curl.exe -sSL -o vulkan_sdk.exe https://sdk.lunarg.com/sdk/download/1.4.357.0/windows/vulkan_sdk.exe
+          $p = Start-Process -FilePath .\vulkan_sdk.exe -NoNewWindow -Wait -PassThru `
+               -ArgumentList '--root','C:\VulkanSDK','--accept-licenses','--default-answer','--confirm-command','install'
+          if ($p.ExitCode -ne 0) { exit $p.ExitCode }
+          "VULKAN_SDK=C:\VulkanSDK" >> $env:GITHUB_ENV
+          "C:\VulkanSDK\Bin" >> $env:GITHUB_PATH
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            spirula/build/slang-*
+            spirula/build/Vulkan-Headers-*
+            spirula/build/MoltenVK-*
+          key: fetched-${{ matrix.platform }}-${{ hashFiles('spirula_patch/*') }}
+
+      - name: Build the renderer library
+        shell: bash
+        working-directory: spirula
+        run: |
+          cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release -DSS_BACKEND=vulkan -DSS_ENABLE_PATENTED=ON
+          cmake --build build --target spirula_render
+
+      - name: Collect
+        shell: bash
+        run: |
+          mkdir -p libout
+          cp "spirula/${{ matrix.lib }}" libout/
+
+      - name: Exports
+        shell: bash
+        run: |
+          case "${{ runner.os }}" in
+            Linux) nm -D --defined-only libout/* | grep ' T ' ;;
+            macOS) nm -gU libout/* | grep ' T ' ;;
+            Windows) dumpbin //exports libout/* | grep sr_ || true ;;
+          esac
+
+      - name: Smoke test (renders on Mesa's software Vulkan)
+        if: runner.os == 'Linux'
+        run: python tools/smoke_test.py libout
+
+      - name: Load test
+        if: runner.os != 'Linux'
+        shell: bash
+        run: |
+          python - <<'EOF'
+          import ctypes, glob, os, sys
+          path = os.path.abspath(glob.glob("libout/*")[0])
+          if sys.platform == "win32":
+              os.add_dll_directory(os.path.dirname(path))
+          L = ctypes.CDLL(path)
+          for name in ("sr_set_splats", "sr_render", "sr_render_ex", "sr_set_colors",
+                       "sr_set_render_degree", "sr_last_error", "sr_shutdown"):
+              getattr(L, name)
+          print("loaded", path, "with all sr_ functions")
+          EOF
+
+      - name: Package
+        shell: bash
+        run: python tools/package.py --lib "libout/$(ls libout)" --platform ${{ matrix.platform }} --out dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spirula_render-${{ matrix.platform }}
+          path: dist/*.zip
+          retention-days: 14
+
+  release:
+    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
+    needs: [build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: spirula_render-*
+          path: assets
+          merge-multiple: true
+
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          ls -l assets
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --notes ""
+          gh release upload "$TAG" assets/* --clobber
