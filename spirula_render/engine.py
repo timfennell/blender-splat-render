@@ -266,6 +266,109 @@ def _render_mirror(n, off, cam_world, fx, fy, cx, cy, W, H, settings, lights=Non
     return _to_linear(rgb, alpha, settings), alpha
 
 
+def _dof_params(scene, cam_obj, cam_world):
+    """The scene camera's depth of field, as Cycles reads it: lens radius in scene units,
+    focus distance along the view axis, aperture blades, rotation and ratio. None if off."""
+    cam = cam_obj.data
+    dof = cam.dof
+    if not meshes.original_use_dof(cam):
+        return None
+    fstop = max(float(dof.aperture_fstop), 1e-5)
+    scale = float(scene.unit_settings.scale_length) or 1.0
+    radius = 0.5 * (cam.lens * 1e-3) / fstop / scale
+    C = np.array(cam_world, np.float64)
+    if dof.focus_object is not None:
+        fwd = -C[:3, 2] / np.linalg.norm(C[:3, 2])
+        target = np.array(dof.focus_object.matrix_world.translation, np.float64)
+        focus = float((target - C[:3, 3]) @ fwd)
+    else:
+        focus = float(dof.focus_distance)
+    if radius <= 0 or focus <= 0:
+        return None
+    return dict(radius=radius, focus=focus, blades=int(dof.aperture_blades),
+                rotation=float(dof.aperture_rotation), ratio=float(dof.aperture_ratio) or 1.0)
+
+
+def lens_samples(n, blades=0, rotation=0.0, ratio=1.0):
+    """n points evenly spread over the aperture (unit radius): a disk, or a polygon with
+    `blades` sides. Vogel's sunflower spiral, so any n covers the shape evenly."""
+    k = np.arange(n) + 0.5
+    r = np.sqrt(k / n)
+    th = k * math.pi * (3 - math.sqrt(5))
+    if blades >= 3:
+        # pull each point in to the polygon's edge in its direction
+        seg = 2 * math.pi / blades
+        a = np.mod(th - rotation, seg) - seg / 2
+        r = r * math.cos(math.pi / blades) / np.cos(a)
+    x, y = r * np.cos(th), r * np.sin(th)
+    return np.stack([x * ratio, y / ratio], 1) if ratio != 1.0 else np.stack([x, y], 1)
+
+
+def _dof_samples(dof, n, cam_world, fx, fy, cx, cy, W, H, settings, test_break=None,
+                 stats=None):
+    """Thin-lens depth of field: the splats rendered from n points across the lens, each view
+    sheared so the focus plane stays put, with the colours already on the GPU (relit once for
+    the lens centre). Yields (linear premultiplied rgb, alpha, ray depth, dx, dy) per sample;
+    dx, dy is the lens point in camera space (OpenCV axes)."""
+    V = np.array(sd.view_matrix(cam_world, _IDENTITY), np.float64)
+    pts = lens_samples(n, dof["blades"], dof["rotation"], dof["ratio"]) * dof["radius"]
+    for i, (lx, ly) in enumerate(pts):
+        if test_break is not None and test_break():
+            return
+        if stats is not None and i % 4 == 0:
+            stats(f"Spirula: depth of field {i + 1}/{n}")
+        dx, dy = float(lx), float(-ly)
+        T = np.eye(4)
+        T[0, 3], T[1, 3] = -dx, -dy
+        Vs = (T @ V).astype(np.float32)
+        with _LOCK:
+            rgb, alpha, d = native.render(Vs, fx, fy, cx + fx * dx / dof["focus"],
+                                          cy + fy * dy / dof["focus"], W, H, settings.primitive)
+        yield _to_linear(rgb, alpha, settings), alpha, d, dx, dy
+
+
+class _MeshWarp:
+    """Cycles' pinhole mesh layer seen from another point on the lens: each pixel moves by
+    its parallax relative to the focus plane (forward, nearest pixel, near over far), and
+    one-pixel cracks from stretching are filled from their neighbours."""
+
+    def __init__(self, M, z, on_top, fx, fy, focus):
+        H, W = z.shape
+        self.M, self.on_top, self.shape = M, on_top, (H, W)
+        self.fx, self.fy, self.focus = fx, fy, focus
+        ys, xs = np.nonzero(np.isfinite(z) & (M[..., 3] > 1e-4))
+        order = np.argsort(-z[ys, xs], kind="stable")          # far first: near writes win
+        self.ys, self.xs = ys[order], xs[order]
+        self.z = z[self.ys, self.xs]
+        self.k = (1.0 / self.z - 1.0 / focus)
+
+    def at(self, dx, dy):
+        H, W = self.shape
+        tu = np.rint(self.xs - self.fx * dx * self.k).astype(np.int64)
+        tv = np.rint(self.ys - self.fy * dy * self.k).astype(np.int64)
+        ok = (tu >= 0) & (tu < W) & (tv >= 0) & (tv < H)
+        out = np.zeros((H, W, 4), np.float32)
+        z = np.full((H, W), np.inf, np.float32)
+        top = np.zeros((H, W), bool)
+        sy, sx, ty, tx = self.ys[ok], self.xs[ok], tv[ok], tu[ok]
+        out[ty, tx] = self.M[sy, sx]
+        z[ty, tx] = self.z[ok]
+        if self.on_top is not None:
+            top[ty, tx] = self.on_top[sy, sx]
+        # cracks: an empty pixel with written neighbours on both sides (left-right or
+        # up-down) is inside a stretched surface, not a gap: take their average
+        empty = ~np.isfinite(z)
+        for a, b in (((0, 1), (0, -1)), ((1, 0), (-1, 0))):
+            za, zb = np.roll(z, a, (0, 1)), np.roll(z, b, (0, 1))
+            fill = empty & np.isfinite(za) & np.isfinite(zb)
+            if fill.any():
+                oa, ob = np.roll(out, a, (0, 1)), np.roll(out, b, (0, 1))
+                out[fill] = (oa[fill] + ob[fill]) / 2
+                z[fill] = np.minimum(za[fill], zb[fill])
+                empty &= ~fill
+        return out, z, top
+
+
 def _blur(img, sigma):
     """Approximate gaussian (three box passes) over the first two axes."""
     r = int(round(sigma * 0.85))
@@ -412,6 +515,7 @@ class SpirulaRenderEngine(bpy.types.RenderEngine):
         film_transparent = meshes.original_film_transparent(scene)
         world = tuple(scene.world.color)[:3] if scene.world else (0.05, 0.05, 0.05)
         frozen = _freeze(depsgraph)
+        dof = _dof_params(scene, cam_obj, cam_world) if settings.dof_samples > 1 else None
         # Show the previous frame's finished image until this one is ready.
         last = _LAST_FRAME.get("args")
         if last is not None and _LAST_FRAME.get("size") == (W, H):
@@ -463,8 +567,36 @@ class SpirulaRenderEngine(bpy.types.RenderEngine):
                 mesh, mirrors, cam_world, fx, fy, cx, cy, W, H, settings,
                 _CACHE.get("lights_used") or _object_space_lights(frozen, _IDENTITY))
         rgba = np.concatenate([rgb, alpha[..., None]], -1)
+        M = None
         if mesh is not None:
-            rgba, depth = self._composite(rgba, depth, mesh, mesh_vis, settings)
+            M = self._mesh_colour(mesh, mesh_vis, settings)
+        if dof is not None and out is not None:
+            # Thin lens: every lens sample sees the splats from its own point (rendered) and the
+            # meshes too (Cycles' pinhole image moved to that point by its depth); the two
+            # meet by depth per sample, then the samples are averaged.
+            t1 = time.time()
+            warp = None if M is None else _MeshWarp(M, mesh["dist"] / ray, mesh.get("on_top"),
+                                                     fx, fy, dof["focus"])
+            acc = np.zeros((H, W, 4), np.float64)
+            n_done = 0
+            for rgb_k, a_k, d_k, dx, dy in _dof_samples(
+                    dof, settings.dof_samples, cam_world, fx, fy, cx, cy, W, H, settings,
+                    self.test_break, lambda m: self.update_stats("", m)):
+                S = np.concatenate([rgb_k, a_k[..., None]], -1)
+                if warp is not None:
+                    Mk, zk, top_k = warp.at(dx, dy)
+                    dS = np.where(a_k > 1e-3, d_k, np.inf)
+                    S = self._blend(S, dS, Mk, zk * ray, top_k)
+                acc += S
+                n_done += 1
+            if n_done:
+                rgba = (acc / n_done).astype(np.float32)
+                if mesh is not None:
+                    depth = np.minimum(depth, mesh["dist"])
+            print(f"Spirula: depth of field, {n_done} lens samples, in {time.time() - t1:.2f}s")
+        elif mesh is not None:
+            rgba = self._blend(rgba, depth, M, mesh["dist"], mesh.get("on_top"))
+            depth = np.minimum(depth, mesh["dist"])
         self._write(rgba, depth, ray, film_transparent, world, W, H, remember=True)
 
     def _quick_look(self, *args):
@@ -577,9 +709,9 @@ class SpirulaRenderEngine(bpy.types.RenderEngine):
             print(f"Spirula: reflection in '{name}' in {time.time() - t:.2f}s")
         return total, cover
 
-    def _composite(self, rgba, depth, mesh, mesh_vis, settings):
-        """Splats and meshes, per pixel by depth. Meshes are relit in this engine's units with
-        each light dimmed by the splats' shadow."""
+    def _mesh_colour(self, mesh, mesh_vis, settings):
+        """Cycles' mesh layer relit in this engine's units, each light dimmed by the splats'
+        shadow, with the splats' reflections added."""
         M = mesh["rgba"].copy()
         if settings.use_relight and mesh["groups"]:
             gain = 2.0 ** settings.exposure
@@ -604,21 +736,29 @@ class SpirulaRenderEngine(bpy.types.RenderEngine):
         if mesh.get("reflection") is not None:
             add, cover = mesh["reflection"]
             M[..., :3] = M[..., :3] * (1 - cover[..., None]) + add
-        S = rgba
+        return M
+
+    @staticmethod
+    def _blend(S, dS, M, dM, on_top=None):
+        """Splats (S, ray depth dS) and meshes (M, dM) per pixel by depth, premultiplied."""
         aS, aM = S[..., 3:4], M[..., 3:4]
         s_over = S + (1 - aS) * M
         m_over = M + (1 - aM) * S
         extent = _CACHE["relighter"].extent if _CACHE.get("relighter") is not None else 1.0
-        dS = np.where(np.isfinite(depth), depth, 1e30)
-        dM = np.where(np.isfinite(mesh["dist"]), mesh["dist"], 1e30)
+        dS = np.where(np.isfinite(dS), dS, 1e30)
+        dM = np.where(np.isfinite(dM), dM, 1e30)
         # soft over a hair's width, so contact (feet on a floor) doesn't alias
         w = 1 / (1 + np.exp(np.clip((dS - dM) / (0.002 * extent), -40, 40)))
-        if mesh.get("on_top") is not None:
-            w = np.where(mesh["on_top"], 0.0, w)            # labels, rulers: over the splats
+        if on_top is not None:
+            w = np.where(on_top, 0.0, w)            # labels, rulers: over the splats
         w = w[..., None].astype(np.float32)
-        out = w * s_over + (1 - w) * m_over
-        depth = np.minimum(depth, mesh["dist"])
-        return out.astype(np.float32), depth
+        return (w * s_over + (1 - w) * m_over).astype(np.float32)
+
+    def _composite(self, rgba, depth, mesh, mesh_vis, settings):
+        """Splats and meshes, per pixel by depth (used by the quick look)."""
+        M = self._mesh_colour(mesh, mesh_vis, settings)
+        return self._blend(rgba, depth, M, mesh["dist"], mesh.get("on_top")), \
+            np.minimum(depth, mesh["dist"])
 
     # ------------------------------------------------------------ viewport
     def view_update(self, context, depsgraph):

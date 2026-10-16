@@ -181,19 +181,20 @@ def mesh_visibility(dist_map, V, f, res, pts, bias, softness):
     zs = np.maximum(z, 1e-9)
     u = f * pc[:, 0] / zs + res / 2
     v = f * pc[:, 1] / zs + res / 2
+    from .relight import _bilinear
     dist = np.linalg.norm(pc, axis=1)
+    inside = front & (u >= 0) & (u < res) & (v >= 0) & (v < res)
     total = np.zeros(len(pts), np.float32)
     taps = 0
+    b = (np.asarray(bias)[:, None] if np.ndim(bias) else bias)
     for du in range(-softness, softness + 1):
         for dv in range(-softness, softness + 1):
-            iu = np.floor(u).astype(np.int64) + du
-            iv = np.floor(v).astype(np.int64) + dv
-            inside = front & (iu >= 0) & (iu < res) & (iv >= 0) & (iv < res)
-            d = np.full(len(pts), np.inf, np.float32)
-            d[inside] = dist_map[iv[inside], iu[inside]]
-            total += (d >= dist - bias).astype(np.float32)
+            # each tap blended over its four pixels, so the edge moves smoothly with the light
+            iu, iv, w = _bilinear(u + du, v + dv, res)
+            lit = dist_map[iv, iu] >= dist[:, None] - b
+            total += np.einsum('nk,nk->n', lit.astype(np.float32), w)
             taps += 1
-    return total / taps
+    return np.where(inside, total / taps, 1.0).astype(np.float32)
 
 
 # ---------------------------------------------------------------- Cycles setup per render
@@ -219,6 +220,11 @@ def prepare_cycles(scene, view_layer):
                              "visible_transmission", "visible_volume_scatter", "visible_shadow"):
                     _set(ob, attr, False, store)
         _set(scene.render, "film_transparent", True, store)
+        # meshes are rendered pinhole: depth of field is done for meshes and splats together
+        cam = scene.camera
+        if cam is not None and cam.type == 'CAMERA':
+            _SAVED["dof"] = (cam.data.name, cam.data.dof.use_dof)
+            _set(cam.data.dof, "use_dof", False, store)
         _set(view_layer, "use_pass_z", True, store)
         _set(view_layer, "use_pass_position", True, store)
         _set(view_layer, "use_pass_diffuse_color", True, store)
@@ -251,6 +257,7 @@ def prepare_cycles(scene, view_layer):
 def restore_cycles():
     store = _SAVED.pop("store", None)
     _SAVED.pop("lights", None)
+    _SAVED.pop("dof", None)
     if not store:
         return
     for owner, attr, old in reversed(store):
@@ -279,6 +286,13 @@ def read_passes(result):
         p.rect.foreach_get(a)
         out[p.name] = a.reshape(H, W, p.channels)[::-1]
     return out
+
+
+def original_use_dof(cam_data):
+    saved = _SAVED.get("dof")
+    if saved is not None and saved[0] == cam_data.name:
+        return saved[1]
+    return cam_data.dof.use_dof
 
 
 def prepared():

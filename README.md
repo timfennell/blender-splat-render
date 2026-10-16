@@ -18,6 +18,16 @@ space, so they overlap and shadow each other), perspective scene cameras, macOS 
 With **Relight** on, the scene's lights light the splats, and the splats shadow themselves and each
 other.
 
+## Depth of field
+
+Turn on the camera's Depth of Field (Camera properties) as for any Blender render: focus distance
+or focus object, f-stop, blades. Final renders then render the splats from **Depth of Field
+Samples** points across the lens (Spirula panel, default 32) and average them, so out-of-focus fur
+blurs over what's behind it as a real lens would. Relighting is done once per frame; each sample
+is one more splat render (about 0.3 s for a 3M-splat model at 1080p). Meshes are rendered sharp by
+Cycles and moved to each lens point by their depth, so they blur with the splats and meet them
+correctly in every sample. The viewport doesn't show depth of field.
+
 ## Meshes alongside the splats
 
 ![Two bee scans with a mirror, a glossy floor, three metal slats and a red ball: shadows and reflections between them](docs/shadows_and_reflections.jpg)

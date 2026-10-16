@@ -49,6 +49,11 @@ class SpirulaSettings(bpy.types.PropertyGroup):
     shadow_resolution: bpy.props.IntProperty(
         name="Shadow Resolution", default=1024, min=128, max=4096,
         description="Size of each light's deep shadow map in pixels (finer = sharper shadows)")
+    dof_samples: bpy.props.IntProperty(
+        name="Depth of Field Samples", default=32, min=1, max=512,
+        description="Final renders with the camera's Depth of Field on: the splats are rendered "
+                    "from this many points across the lens and averaged (exact blur, fur included). "
+                    "Each sample is one more splat render; relighting is done once")
     use_meshes: bpy.props.BoolProperty(
         name="Meshes", default=True,
         description="Render polygon objects too (path traced by Blender's Cycles inside this engine), "
@@ -91,6 +96,10 @@ class SPIRULA_PT_render(bpy.types.Panel):
             box.prop(vs, "view_transform")
         layout.prop(context.scene.render, "film_transparent")
         layout.prop(s, "viewport_resolution")
+        row = layout.row()
+        cam = context.scene.camera
+        row.active = cam is not None and cam.type == 'CAMERA' and cam.data.dof.use_dof
+        row.prop(s, "dof_samples")
         layout.separator()
         layout.prop(s, "use_relight")
         col = layout.column()
@@ -139,7 +148,7 @@ class SPIRULA_PT_object(bpy.types.Panel):
 # Panels other engines share that make sense here too.
 _SHARED = ("RENDER_PT_format", "RENDER_PT_frame_range", "RENDER_PT_output", "RENDER_PT_encoding",
            "RENDER_PT_color_management", "RENDER_PT_stamp", "DATA_PT_lens", "DATA_PT_camera",
-           "VIEWLAYER_PT_layer_passes", "DATA_PT_light", "DATA_PT_spot", "DATA_PT_context_light",
+           "VIEWLAYER_PT_layer_passes", "DATA_PT_camera_dof", "DATA_PT_camera_dof_aperture", "DATA_PT_light", "DATA_PT_spot", "DATA_PT_context_light",
            # meshes are rendered by Cycles: its material, world and object panels apply
            "CYCLES_MATERIAL_PT_preview", "CYCLES_MATERIAL_PT_surface", "CYCLES_MATERIAL_PT_settings",
            "CYCLES_MATERIAL_PT_settings_surface", "MATERIAL_PT_context_material", "MATERIAL_PT_viewport",

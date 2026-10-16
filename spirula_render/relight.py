@@ -67,14 +67,32 @@ def look_at(eye, target, up_hint=(0.0, 0.0, 1.0)):
     return V
 
 
+def _bilinear(u, v, res):
+    """The four pixels around continuous pixel coordinates u, v and their weights:
+    (iu [N,4], iv [N,4], w [N,4]). Pixel i covers [i, i+1); its centre is i + 0.5."""
+    x, y = u - 0.5, v - 0.5
+    x0, y0 = np.floor(x), np.floor(y)
+    fx, fy = (x - x0).astype(np.float32), (y - y0).astype(np.float32)
+    x0, y0 = x0.astype(np.int64), y0.astype(np.int64)
+    iu = np.stack([x0, x0 + 1, x0, x0 + 1], 1)
+    iv = np.stack([y0, y0, y0 + 1, y0 + 1], 1)
+    w = np.stack([(1 - fx) * (1 - fy), fx * (1 - fy), (1 - fx) * fy, fx * fy], 1)
+    return np.clip(iu, 0, res - 1), np.clip(iv, 0, res - 1), w
+
+
 class DeepShadow:
     """Light transmittance at every depth, seen from one light (a deep opacity map).
 
     Fur is semi-transparent: light fades gradually as it passes through hair, so a
     splat's visibility is the product of (1 - opacity) of everything between it and
-    the light, not a single "is it behind the surface" test. Each splat is binned
-    into the light's pixel grid, each pixel's splats are sorted by distance, and a
-    running sum of log transmittance gives the light left at any depth there.
+    the light, not a single "is it behind the surface" test. Each splat's optical depth
+    is shared among the four map pixels around its centre (bilinear weights), each
+    pixel's entries are sorted by distance, and a running sum gives the optical depth in
+    front of any depth there. Reading back uses the same four pixels and weights.
+
+    Sharing (rather than dropping each splat into the one pixel under its centre) keeps
+    shadows continuous as the light moves: a hair crossing a pixel boundary hands its
+    shadow over gradually instead of all at once, which showed as jittering fur.
     """
 
     def __init__(self, V, f, res, means, opacity, size):
@@ -82,37 +100,31 @@ class DeepShadow:
         given here must be in front of the light and inside its view."""
         self.V, self.f, self.res = V, f, res
         u, v, dist, z = self._project(means)
-        iu = np.clip(np.floor(u).astype(np.int64), 0, res - 1)
-        iv = np.clip(np.floor(v).astype(np.int64), 0, res - 1)
         # Share of a pixel each splat covers (its 2-sigma disc), so small splats
         # occlude a little and big ones fully.
         r_pix = 2.0 * size * self.f / np.maximum(z, 1e-9)
         cover = np.minimum(1.0, math.pi * r_pix * r_pix)
         a = np.clip(opacity * cover, 0.0, 0.999)
+        tau = -np.log1p(-a).astype(np.float64)                         # optical depth
         self.dmax = (float(dist.max()) if len(dist) else 1.0) * 1.0001 + 1e-9
-        pix = iv * res + iu
-        key = pix.astype(np.float64) + dist / self.dmax
-        order = np.argsort(key, kind="stable")
+        iu, iv, w = _bilinear(u, v, res)
+        self.iu, self.iv, self.w = iu, iv, w
+        pix = iv * res + iu                                            # [N, 4]
+        key = (pix.astype(np.float64) + (dist / self.dmax)[:, None]).ravel()
+        order = np.argsort(key)
         self.key = key[order]
-        self.cum = np.concatenate([[0.0], np.cumsum(np.log1p(-a[order]))])
-        # For each splat in this map: where its pixel's column starts and ends in the sorted
-        # order, and its own place in it -- so what lies in front of it needs no search.
-        n = len(order)
-        sp = pix[order]
-        new = np.ones(n, bool)
-        new[1:] = sp[1:] != sp[:-1]
-        start_sorted = np.maximum.accumulate(np.where(new, np.arange(n), 0))
-        last = np.ones(n, bool)
-        last[:-1] = sp[1:] != sp[:-1]
-        end_sorted = np.minimum.accumulate(np.where(last, np.arange(n) + 1, n)[::-1])[::-1]
-        self.rank = np.empty(n, np.int64)
-        self.rank[order] = np.arange(n)
-        self.col_start = start_sorted[self.rank]
-        self.col_end = end_sorted[self.rank]
-        self.pix_iu, self.pix_iv = iu, iv
+        self.cum = np.concatenate([[0.0], np.cumsum((tau[:, None] * w).ravel()[order])])
+        self.rank = np.empty(len(order), np.int64)                     # entry -> sorted place
+        self.rank[order] = np.arange(len(order))
+        self.rank = self.rank.reshape(-1, 4)
+        # where each pixel's entries start in the sorted order
+        self.start = np.searchsorted(self.key, np.arange(res * res + 1, dtype=np.float64), side="left")
+        self.pix = pix
+        self.dist = dist
+        self.u, self.v = u, v
         # Exact coverage per pixel from the renderer itself (every splat's full footprint),
-        # seen from the light. The binned map above only knows each splat's centre pixel,
-        # which undercounts coverage through a thin shell; it is used for depth ORDER only.
+        # seen from the light. The binned map above only knows splat centres, which
+        # undercounts coverage through a thin shell; it is used for depth ORDER only.
         self.gpu_T = None
         self.gpu_depth = None
         try:
@@ -132,65 +144,92 @@ class DeepShadow:
 
     density = 1.0              # optical depth multiplier for shadows (thin shells block more)
 
-    def self_visibility(self, softness=1, bias=0.0):
-        """Light reaching each splat this map was built from (fast path: no searching).
+    def _coverage_log_T(self, u, v, softness):
+        """The renderer's coverage seen from the light (log transmittance), box-blurred for
+        soft edges and read bilinearly at u, v."""
+        logT = _blurred_log_T(self.gpu_T, softness)
+        iu, iv, w = _bilinear(u, v, self.res)
+        return np.einsum('nk,nk->n', logT[iv, iu], w)
 
-        The renderer's exact coverage of the splat's column, raised to the share of that
-        column's optical depth lying in front of the splat; softness blurs the coverage
-        image over (2*softness+1)^2 pixels for soft shadow edges."""
-        if np.any(np.asarray(bias) > 0):
-            # only what lies more than `bias` in front counts (a splat's own surface layer
-            # mustn't shade it): one search, inside the splat's own column
-            q = self.key[self.rank] - np.asarray(bias, np.float64) / self.dmax
-            q = np.maximum(q, np.floor(self.key[self.rank]))
-            stop = np.minimum(np.searchsorted(self.key, q, side="left"), self.rank)
-        else:
-            stop = self.rank
-        before = self.cum[stop] - self.cum[self.col_start]              # <= 0, self excluded
-        whole = self.cum[self.col_end] - self.cum[self.col_start]
-        frac = np.where(whole < -1e-12, before / np.minimum(whole, -1e-12), 0.0)
+    def _combine(self, front, whole, w, u, v, softness, empty_frac=None):
+        """Per point: optical depth in front of it and in its whole column (per neighbour
+        pixel, [N,4]) -> light reaching it."""
+        f_tau = np.einsum('nk,nk->n', front, w)
+        w_tau = np.einsum('nk,nk->n', whole, w)
         if self.gpu_T is None:
-            return np.exp(self.density * before).astype(np.float32)
-        T = self.gpu_T
-        if softness > 0:
-            logT = np.log(T)
-            k = 2 * softness + 1
-            for axis in (0, 1):                                          # separable box blur
-                c = np.cumsum(np.pad(logT, [(softness + 1, softness)] if axis == 0 else
-                                     [(0, 0), (softness + 1, softness)], mode='edge'), axis=axis)
-                logT = ((c[k:] - c[:-k]) if axis == 0 else (c[:, k:] - c[:, :-k])) / k
-            T = np.exp(logT)
-        t = T[self.pix_iv, self.pix_iu]
-        return np.power(t, self.density * np.clip(frac, 0.0, 1.0)).astype(np.float32)
+            return np.exp(-self.density * f_tau).astype(np.float32)
+        frac = np.where(w_tau > 1e-12, f_tau / np.maximum(w_tau, 1e-12),
+                        0.0 if empty_frac is None else empty_frac)
+        lt = self._coverage_log_T(u, v, softness)
+        return np.exp(self.density * np.clip(frac, 0.0, 1.0) * lt).astype(np.float32)
+
+    def self_visibility(self, softness=1, bias=0.0):
+        """Light reaching each splat this map was built from: the share of its columns'
+        optical depth lying in front of it (more than `bias` in front, so a splat's own
+        surface layer doesn't shade it), applied to the renderer's coverage there."""
+        r = self.rank                                                  # [N, 4]
+        s = self.start[self.pix]
+        e = self.start[self.pix + 1]
+        if np.any(np.asarray(bias) > 0):
+            # searched in sorted order, the queries are nearly ascending, which numpy's
+            # binary search exploits (several times faster than in splat order)
+            n = len(self.key)
+            inv = np.empty(n, np.int64)
+            inv[r.ravel()] = np.arange(n) // 4                          # sorted place -> splat
+            b = np.asarray(bias, np.float64)
+            b_sorted = b[inv] if b.ndim else np.full(n, float(b))
+            q = np.maximum(self.key - b_sorted / self.dmax, np.floor(self.key))
+            stop_sorted = np.minimum(np.searchsorted(self.key, q, side="left"), np.arange(n))
+            stop = stop_sorted[r]
+        else:
+            stop = r
+        front = self.cum[stop] - self.cum[s]
+        whole = self.cum[e] - self.cum[s]
+        return self._combine(front, whole, self.w, self.u, self.v, softness)
+
+    def query(self, pts, bias, softness, surface=False):
+        """Light reaching arbitrary points (other splats, mesh surfaces). Points outside the
+        light's view are lit. surface=True: a column without splats takes its in-front
+        share from comparing the point's distance with the coverage's mean depth around it
+        (its coverage there is only neighbours' blurred edges)."""
+        u, v, dist, _ = self._project(pts)
+        pz = pts @ self.V[2, :3].astype(np.float32) + np.float32(self.V[2, 3])
+        res = self.res
+        seen = (pz > 1e-9) & (u >= 0) & (u < res) & (v >= 0) & (v < res)
+        out = np.ones(len(pts), np.float32)
+        if not np.any(seen):
+            return out
+        u, v, dist = u[seen], v[seen], dist[seen]
+        iu, iv, w = _bilinear(u, v, res)
+        pix = iv * res + iu
+        d = np.minimum(np.maximum(dist - np.asarray(bias)[seen] if np.ndim(bias) else dist - bias,
+                                  0.0) / self.dmax, 0.9999)
+        s = self.start[pix]
+        e = self.start[pix + 1]
+        stop = np.searchsorted(self.key, (pix + d[:, None]).ravel(), side="left").reshape(pix.shape)
+        front = self.cum[stop] - self.cum[s]
+        whole = self.cum[e] - self.cum[s]
+        empty_frac = None
+        if surface and self.gpu_depth is not None:
+            r = softness + 1
+            k = 2 * r + 1
+            a = self.gpu_alpha.astype(np.float64)
+
+            def box(img):
+                for axis in (0, 1):
+                    c = np.cumsum(np.pad(img, [(r + 1, r)] if axis == 0 else [(0, 0), (r + 1, r)],
+                                         mode='constant'), axis=axis)
+                    img = (c[k:] - c[:-k]) if axis == 0 else (c[:, k:] - c[:, :-k])
+                return img
+            D = box(a * self.gpu_depth) / np.maximum(box(a), 1e-9)
+            Dp = np.einsum('nk,nk->n', D[iv, iu], w)
+            b = float(np.max(bias)) if np.ndim(bias) else float(bias)
+            empty_frac = np.clip((dist - Dp) / max(4.0 * b, 1e-9) + 0.5, 0.0, 1.0)
+        out[seen] = self._combine(front, whole, w, u, v, softness, empty_frac)
+        return out
 
     def visibility(self, means, bias, radius=1):
-        """Light reaching each splat centre, 0..1, averaged over nearby pixels for soft edges."""
-        u, v, dist, _ = self._project(means)
-        # points outside this light's view (mesh surfaces can be) have no splat before them
-        pz = means @ self.V[2, :3].astype(np.float32) + np.float32(self.V[2, 3])
-        seen = (pz > 1e-9) & (u >= 0) & (u < self.res) & (v >= 0) & (v < self.res)
-        d = np.minimum(np.maximum(dist - bias, 0.0) / self.dmax, 0.9999)
-        total = np.zeros(len(means), np.float64)
-        taps = 0
-        for du in range(-radius, radius + 1):
-            for dv in range(-radius, radius + 1):
-                iu = np.clip(np.floor(u).astype(np.int64) + du, 0, self.res - 1)
-                iv = np.clip(np.floor(v).astype(np.int64) + dv, 0, self.res - 1)
-                pix = (iv * self.res + iu).astype(np.float64)
-                start = np.searchsorted(self.key, pix, side="left")
-                stop = np.searchsorted(self.key, pix + d, side="left")
-                if self.gpu_T is None:
-                    total += np.exp(self.density * (self.cum[stop] - self.cum[start]))
-                else:
-                    end = np.searchsorted(self.key, pix + 1.0, side="left")
-                    before = self.cum[stop] - self.cum[start]          # <= 0
-                    whole = self.cum[end] - self.cum[start]            # <= 0
-                    # share of this column's occlusion that lies in front of the splat
-                    frac = np.where(whole < -1e-9, before / np.minimum(whole, -1e-9),
-                                    (stop > start).astype(np.float64))
-                    total += np.power(self.gpu_T[iv, iu], self.density * np.clip(frac, 0.0, 1.0))
-                taps += 1
-        return np.where(seen, total / taps, 1.0).astype(np.float32)
+        return self.query(means, bias, radius)
 
 
 def _blurred_log_T(T, softness):
@@ -205,59 +244,8 @@ def _blurred_log_T(T, softness):
 
 
 def surface_visibility(sm, pts, bias, softness):
-    """Light reaching points on other surfaces (meshes) through the splats of map `sm`.
-
-    Like DeepShadow.visibility, but the coverage is read with bilinear filtering: a mesh
-    surface is continuous, and nearest-pixel reads show the shadow map's pixels as steps
-    where it meets the surface at a grazing angle."""
-    u, v, dist, _ = sm._project(pts)
-    pz = pts @ sm.V[2, :3].astype(np.float32) + np.float32(sm.V[2, 3])
-    res = sm.res
-    seen = (pz > 1e-9) & (u >= 0) & (u < res) & (v >= 0) & (v < res)
-    out = np.ones(len(pts), np.float32)
-    if sm.gpu_T is None or not np.any(seen):
-        return np.where(seen, sm.visibility(pts, bias, softness), 1.0).astype(np.float32)
-    u, v, dist = u[seen], v[seen], dist[seen]
-    logT = _blurred_log_T(sm.gpu_T, softness)
-    # share of each column's occlusion in front of the point (nearest column)
-    iu = np.clip(np.floor(u).astype(np.int64), 0, res - 1)
-    iv = np.clip(np.floor(v).astype(np.int64), 0, res - 1)
-    pix = (iv * res + iu).astype(np.float64)
-    d = np.minimum(np.maximum(dist - bias, 0.0) / sm.dmax, 0.9999)
-    start = np.searchsorted(sm.key, pix, side="left")
-    stop = np.searchsorted(sm.key, pix + d, side="left")
-    end = np.searchsorted(sm.key, pix + 1.0, side="left")
-    before = sm.cum[stop] - sm.cum[start]
-    whole = sm.cum[end] - sm.cum[start]
-    frac = np.where(whole < -1e-9, before / np.minimum(whole, -1e-9), 0.0)
-    empty = whole >= -1e-9
-    if np.any(empty) and sm.gpu_depth is not None:
-        # A column with no splats: its coverage is only the neighbours' blurred edge. Whether
-        # that edge is in front of the point: compare with the neighbours' mean depth.
-        r = softness + 1
-        k = 2 * r + 1
-        a = sm.gpu_alpha.astype(np.float64)
-        ad = a * sm.gpu_depth
-        def box(img):
-            for axis in (0, 1):
-                c = np.cumsum(np.pad(img, [(r + 1, r)] if axis == 0 else [(0, 0), (r + 1, r)],
-                                     mode='constant'), axis=axis)
-                img = (c[k:] - c[:-k]) if axis == 0 else (c[:, k:] - c[:, :-k])
-            return img
-        D = box(ad) / np.maximum(box(a), 1e-9)
-        de = dist[empty] - D[iv[empty], iu[empty]]
-        frac[empty] = np.clip(de / max(4.0 * float(np.max(bias)) if np.ndim(bias) else 4.0 * bias, 1e-9) + 0.5,
-                              0.0, 1.0)
-    # coverage, bilinear between pixel centres
-    x, y = u - 0.5, v - 0.5
-    x0 = np.clip(np.floor(x).astype(np.int64), 0, res - 1)
-    y0 = np.clip(np.floor(y).astype(np.int64), 0, res - 1)
-    x1, y1 = np.minimum(x0 + 1, res - 1), np.minimum(y0 + 1, res - 1)
-    fx, fy = np.clip(x - x0, 0, 1), np.clip(y - y0, 0, 1)
-    lt = (logT[y0, x0] * (1 - fx) * (1 - fy) + logT[y0, x1] * fx * (1 - fy) +
-          logT[y1, x0] * (1 - fx) * fy + logT[y1, x1] * fx * fy)
-    out[seen] = np.exp(sm.density * np.clip(frac, 0.0, 1.0) * lt)
-    return out
+    """Light reaching points on other surfaces (meshes) through the splats of map `sm`."""
+    return sm.query(pts, bias, softness, surface=True)
 
 
 def light_visibility(eye, target, corners, means, opacity, size, query, bias, res, softness,
@@ -360,16 +348,16 @@ def quick_light_visibility(eye, target, corners, means, width, res, density=1.0,
         z = np.maximum(pc[:, 2], 1e-9)
         u = f * pc[:, 0] / z + res / 2
         v = f * pc[:, 1] / z + res / 2
-        iu = np.clip(u.astype(np.int64), 0, res - 1)
-        iv = np.clip(v.astype(np.int64), 0, res - 1)
-        dist = np.linalg.norm(pc, axis=1)
+        iu, iv, wb = _bilinear(u, v, res)        # four pixels, blended: no jumps as it moves
+        dist = np.linalg.norm(pc, axis=1)[:, None]
         a = alpha[iv, iu]
         med = np.where(a > 0.5, median[iv, iu], np.inf)
+        ww = np.asarray(w)[:, None] if np.ndim(w) else w
         # light is 50% at the median depth by definition, fades from full in front of it,
         # and can't fall below what gets through the whole column
-        T_d = np.exp(-math.log(2.0) * np.exp(np.clip((dist - med) / np.maximum(w, 1e-12), -30, 30)))
+        T_d = np.exp(-math.log(2.0) * np.exp(np.clip((dist - med) / np.maximum(ww, 1e-12), -30, 30)))
         T_floor = np.power(np.clip(1.0 - a, 1e-6, 1.0), density)
-        out = np.maximum(T_d, T_floor)
+        out = np.einsum('nk,nk->n', np.maximum(T_d, T_floor), wb)
         if outside_lit:
             out = np.where((pc[:, 2] > 1e-9) & (u >= 0) & (u < res) & (v >= 0) & (v < res), out, 1.0)
         return out
