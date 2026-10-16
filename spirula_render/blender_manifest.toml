@@ -1,0 +1,13 @@
+schema_version = "1.0.0"
+
+id = "spirula_render"
+version = "0.1.0"
+name = "Spirula Render"
+tagline = "Render 3D Gaussian splats with Spirula Studio's own renderer"
+maintainer = "Tim Fennell"
+type = "add-on"
+
+blender_version_min = "5.3.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+platforms = ["macos-arm64"]

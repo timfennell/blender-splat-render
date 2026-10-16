@@ -1,0 +1,3 @@
+dist/
+__pycache__/
+spirula_render/lib/*.dylib
