@@ -16,6 +16,11 @@ class SpirulaSettings(bpy.types.PropertyGroup):
         items=[('SRGB', "sRGB", "Splats were trained on ordinary (sRGB) photos: convert to Blender's "
                                 "linear space after blending, as the trainer saw them"),
                ('LINEAR', "Linear", "Splats were trained on linear images (e.g. RAW)")])
+    viewport_resolution: bpy.props.EnumProperty(
+        name="Viewport Resolution", default='HALF',
+        items=[('FULL', "Full", "Render the viewport at full resolution"),
+               ('HALF', "Half", "Render the viewport at half resolution (4x faster)"),
+               ('QUARTER', "Quarter", "Render the viewport at quarter resolution (16x faster)")])
     use_relight: bpy.props.BoolProperty(
         name="Relight", default=False,
         description="Light the splats with the scene's lights instead of the lighting baked into the scan")
@@ -27,6 +32,10 @@ class SpirulaSettings(bpy.types.PropertyGroup):
         description="Brightness of the scene's lights, in stops (light units follow Cycles)")
     use_shadows: bpy.props.BoolProperty(
         name="Shadows", default=True, description="The model casts shadows onto itself")
+    viewport_shadows: bpy.props.BoolProperty(
+        name="Viewport Shadows", default=False,
+        description="Shadows in the viewport too (several seconds per light change on big scans; "
+                    "final renders always have them)")
     shadow_resolution: bpy.props.IntProperty(
         name="Shadow Resolution", default=1024, min=128, max=4096,
         description="Size of each light's deep shadow map in pixels (finer = sharper shadows)")
@@ -59,6 +68,7 @@ class SPIRULA_PT_render(bpy.types.Panel):
             box.label(text="Use Standard to match the trained colours exactly")
             box.prop(vs, "view_transform")
         layout.prop(context.scene.render, "film_transparent")
+        layout.prop(s, "viewport_resolution")
         layout.separator()
         layout.prop(s, "use_relight")
         col = layout.column()
@@ -68,6 +78,7 @@ class SPIRULA_PT_render(bpy.types.Panel):
         col.prop(s, "use_shadows")
         sub = col.column()
         sub.active = s.use_shadows
+        sub.prop(s, "viewport_shadows")
         sub.prop(s, "shadow_resolution")
         sub.prop(s, "shadow_softness")
 
