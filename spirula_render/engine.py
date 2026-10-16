@@ -67,33 +67,42 @@ def _lights_key(lights, settings, shadows):
             shadows, settings.shadow_resolution, settings.shadow_softness)
 
 
-def _ensure_colours(depsgraph, obj, cam_world, settings, report, follow_camera=True):
+def _ensure_colours(depsgraph, obj, cam_world, settings, report, follow_camera=True, quick=False):
     """Put the right colours on the GPU: the original ones, or relit by the scene's lights.
 
     follow_camera=False (viewport) keeps the last relit colours while only the view
-    moves; lighting is redone when lights or settings change."""
+    moves; lighting is redone when lights or settings change. quick=True relights the
+    base colour only, without shadows, and renders without the higher SH bands: fast
+    enough to follow a light being dragged. Returns the lighting key now on the GPU."""
     d = _CACHE["splats"]
     if not settings.use_relight:
         if _CACHE["colour_key"] is not None:
             native.set_colors(d["dc"], d["sh"])
             _CACHE["colour_key"] = None
-        return
+        native.set_render_degree(-1)
+        return None
     if _CACHE.get("relighter") is None:
         _CACHE["relighter"] = relight.Relighter(d)
     lights = _object_space_lights(depsgraph, obj.matrix_world)
     Minv = np.linalg.inv(np.array(obj.matrix_world, np.float64))
     cam_pos = (Minv @ np.array(cam_world, np.float64)[:, 3])[:3].astype(np.float32)
-    shadows = settings.use_shadows and (follow_camera or settings.viewport_shadows)
-    key = _lights_key(lights, settings, shadows)
+    shadows = settings.use_shadows and (follow_camera or settings.viewport_shadows) and not quick
+    key = _lights_key(lights, settings, shadows) + ("quick" if quick else "full",)
     if follow_camera:
         key = key + (tuple(np.round(cam_pos, 5)),)
-    if _CACHE["colour_key"] is not None and _CACHE["colour_key"][:len(key)] == key:
-        return
-    dc, sh = _CACHE["relighter"].colours(
-        lights, cam_pos, settings.ambient, settings.exposure, shadows,
-        settings.shadow_resolution, settings.shadow_softness, settings.primitive, report)
-    native.set_colors(dc, sh)
-    _CACHE["colour_key"] = key
+    if _CACHE["colour_key"] != key and quick:
+        native.set_colors(_CACHE["relighter"].quick_dc(lights, cam_pos, settings.ambient,
+                                                       settings.exposure), None)
+        _CACHE["colour_key"] = key
+    elif _CACHE["colour_key"] != key:
+        dc, sh = _CACHE["relighter"].colours(
+            lights, cam_pos, settings.ambient, settings.exposure, shadows,
+            settings.shadow_resolution, settings.shadow_softness, settings.primitive, report,
+            diffuse_only=quick)
+        native.set_colors(dc, sh)
+        _CACHE["colour_key"] = key
+    native.set_render_degree(0 if quick else -1)
+    return _lights_key(lights, settings, settings.use_shadows)
 
 
 def _splat_objects(depsgraph):
@@ -102,7 +111,7 @@ def _splat_objects(depsgraph):
 
 
 def _render_view(depsgraph, settings, cam_world, V_of_obj, fx, fy, cx, cy, W, H, report,
-                 follow_camera=True):
+                 follow_camera=True, quick=False):
     """Render the scene's splat object. Returns linear premultiplied rgb, alpha, ray depth."""
     splats = _splat_objects(depsgraph)
     if not splats:
@@ -113,7 +122,7 @@ def _render_view(depsgraph, settings, cam_world, V_of_obj, fx, fy, cx, cy, W, H,
     original = bpy.data.objects.get(obj.name)              # attribute data lives here
     with _LOCK:
         _upload(original if original is not None else obj)
-        _ensure_colours(depsgraph, obj, cam_world, settings, report, follow_camera)
+        _ensure_colours(depsgraph, obj, cam_world, settings, report, follow_camera, quick)
         rgb, alpha, d = native.render(V_of_obj(obj), fx, fy, cx, cy, W, H, settings.primitive)
     if settings.colour_input == 'SRGB':
         # The renderer blends in the model's (sRGB) space; Blender wants linear.
@@ -155,6 +164,31 @@ def _viewport_camera(rv3d, W, H, obj_world, scene_size):
     return V, fx, fy, cx, cy, cam_world
 
 
+REFINE_DELAY = 0.5      # seconds the lights must be still before the full relight
+
+
+_REFINE = {"changed_at": 0.0, "pending": False}
+
+
+def _schedule_refine():
+    """Redraw the 3D views once the lights have been still for REFINE_DELAY, so the full
+    relight replaces the quick one."""
+    if _REFINE["pending"]:
+        return
+    _REFINE["pending"] = True
+
+    def check():
+        if time.time() - _REFINE["changed_at"] < REFINE_DELAY:
+            return 0.1                           # still moving: look again shortly
+        _REFINE["pending"] = False
+        for win in bpy.context.window_manager.windows:
+            for area in win.screen.areas:
+                if area.type == 'VIEW_3D':
+                    area.tag_redraw()
+        return None
+    bpy.app.timers.register(check, first_interval=REFINE_DELAY)
+
+
 class SpirulaRenderEngine(bpy.types.RenderEngine):
     bl_idname = "SPIRULA"
     bl_label = "Spirula (3DGS)"
@@ -164,7 +198,8 @@ class SpirulaRenderEngine(bpy.types.RenderEngine):
 
     def __init__(self, *args, **kw):
         super().__init__(*args, **kw)
-        self._view = {"key": None, "texture": None, "size": None, "dirty": True}
+        self._view = {"key": None, "texture": None, "size": None, "dirty": True,
+                      "lights": None, "quality": None, "changed_at": 0.0}
 
     # ------------------------------------------------------------ final render
     def update_render_passes(self, scene=None, renderlayer=None):
@@ -189,7 +224,8 @@ class SpirulaRenderEngine(bpy.types.RenderEngine):
         self.update_stats("", "Spirula: rendering")
         out = _render_view(depsgraph, settings, cam_world,
                            lambda obj: sd.view_matrix(cam_world, obj.matrix_world),
-                           fx, fy, cx, cy, W, H, lambda m: self.report({'WARNING'}, m))
+                           fx, fy, cx, cy, W, H, lambda m: self.report({'WARNING'}, m),
+                           quick=False)
         if out is None:
             rgb = np.zeros((H, W, 3), np.float32)
             alpha = np.zeros((H, W), np.float32)
@@ -228,10 +264,31 @@ class SpirulaRenderEngine(bpy.types.RenderEngine):
         region, rv3d, scene = context.region, context.region_data, depsgraph.scene
         settings = scene.spirula
         scale = {'FULL': 1, 'HALF': 2, 'QUARTER': 4}[settings.viewport_resolution]
+        if settings.use_relight and time.time() - _REFINE["changed_at"] < REFINE_DELAY:
+            scale *= 2                               # lights moving: a lighter preview
         W, H = max(1, region.width // scale), max(1, region.height // scale)
         view_key = (tuple(map(tuple, rv3d.perspective_matrix)), W, H)
         v = self._view
+        # While the lights keep changing, relight the quick way; once they've been
+        # still for a moment, the timer below asks for the full SH relight.
+        quick = False
+        if settings.use_relight:
+            splats_now = _splat_objects(depsgraph)
+            if splats_now:
+                lk = _lights_key(_object_space_lights(depsgraph, splats_now[0].matrix_world),
+                                 settings, settings.use_shadows)
+                now = time.time()
+                if lk != v["lights"]:
+                    if v["lights"] is not None:
+                        _REFINE["changed_at"] = now
+                    v["lights"] = lk
+                quick = now - _REFINE["changed_at"] < REFINE_DELAY
+                if quick:
+                    _schedule_refine()
+                if v["quality"] != ("quick" if quick else "full"):
+                    v["dirty"] = True
         if v["dirty"] or v["key"] != view_key or v["texture"] is None:
+            v["quality"] = "quick" if quick else "full"
             v["dirty"] = False
             v["key"] = view_key
             splats = _splat_objects(depsgraph)
@@ -242,7 +299,7 @@ class SpirulaRenderEngine(bpy.types.RenderEngine):
             V, fx, fy, cx, cy, cam_world = _viewport_camera(rv3d, W, H, obj_world, size)
             try:
                 out = _render_view(depsgraph, settings, cam_world, lambda obj: V, fx, fy, cx, cy,
-                                   W, H, lambda m: None, follow_camera=False)
+                                   W, H, lambda m: None, follow_camera=False, quick=quick)
             except native.RenderError as e:
                 out = None
                 print("Spirula viewport:", e)

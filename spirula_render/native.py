@@ -33,6 +33,8 @@ def lib():
         L.sr_render_ex.restype = ctypes.c_int
         L.sr_set_colors.argtypes = [_FP, _FP]
         L.sr_set_colors.restype = ctypes.c_int
+        L.sr_set_render_degree.argtypes = [ctypes.c_int]
+        L.sr_set_render_degree.restype = None
         _LIB = L
     return _LIB
 
@@ -84,3 +86,8 @@ def render_ex(viewmat, fx, fy, cx, cy, width, height, primitive="3dgs"):
     _check(lib().sr_render_ex(_p(V), fx, fy, cx, cy, width, height, primitive.encode(),
                               _p(rgb), _p(alpha), _p(depth), _p(median)), "rendering")
     return rgb, alpha, depth, median
+
+
+def set_render_degree(degree):
+    """Render with at most `degree` SH bands (0 = base colour only); -1 = all loaded bands."""
+    lib().sr_set_render_degree(int(degree))

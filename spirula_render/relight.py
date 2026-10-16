@@ -148,14 +148,45 @@ class Relighter:
         self.c = c
         self.albedo_lin = srgb_to_linear(c)          # captured colour as albedo
 
+    def facing_normals(self, cam_pos):
+        """Normals turned towards the camera, cached per camera position."""
+        key = tuple(np.round(cam_pos, 4))
+        if getattr(self, "_n_key", None) != key:
+            n = self.normals.copy()
+            flip = np.einsum('ij,ij->i', n, cam_pos[None, :] - self.means) < 0
+            n[flip] *= -1
+            self._n, self._n_key = n, key
+        return self._n
+
+    def quick_dc(self, lights, cam_pos, ambient, exposure):
+        """Fast approximate base-colour relight for dragging lights: grey irradiance and a
+        gamma approximation of the sRGB curve, no shadows, no SH."""
+        n = self.facing_normals(cam_pos)
+        E = np.full(len(n), ambient, np.float32)
+        tint = np.zeros(3, np.float32)
+        gain = 2.0 ** exposure
+        for L in lights:
+            col = np.asarray(L["colour"], np.float32)
+            if L["type"] == 'SUN':
+                ldir = (-L["dir"] / np.linalg.norm(L["dir"])).astype(np.float32)
+                w = gain * L["strength"] / math.pi
+                E += w * np.maximum(n @ ldir, 0)
+            else:
+                dvec = (L["pos"][None, :] - self.means).astype(np.float32)
+                dist = np.sqrt(np.einsum('ij,ij->i', dvec, dvec))
+                cosv = np.einsum('ij,ij->i', n, dvec) / np.maximum(dist, 1e-12)
+                w = gain * L["power"] / (4 * math.pi * math.pi)
+                E += w * np.maximum(cosv, 0) / np.maximum(dist * L["world_per_object"], 1e-6) ** 2
+            tint += col
+        tint = tint / len(lights) if lights else np.ones(3, np.float32)
+        f = np.power(np.maximum(E, 0), 1 / 2.2)[:, None] * tint[None, :]
+        return ((self.c * f - 0.5) / C0).astype(np.float32)
+
     def colours(self, lights, cam_pos, ambient, exposure, shadows, shadow_res, softness,
-                primitive, report=print):
+                primitive, report=print, diffuse_only=False):
         """lights: dicts in object space (type, pos, dir, colour rgb, power W or strength,
         spot cos limits, world_per_object). Returns new dc [N,3] and sh [N,K,3]."""
-        n = self.normals.copy()
-        to_cam = cam_pos[None, :] - self.means
-        flip = np.einsum('ij,ij->i', n, to_cam) < 0
-        n[flip] *= -1
+        n = self.facing_normals(cam_pos)
         E = np.full((len(n), 3), ambient, np.float32)
         gain = 2.0 ** exposure
         bias = 2.0 * self.splat_size                 # don't let a splat shadow itself
@@ -191,5 +222,7 @@ class Relighter:
         # Ratio of new to captured colour; splats captured black stay as they were.
         f = np.where(self.c > 1e-4, lit / np.maximum(self.c, 1e-4), 1.0).astype(np.float32)
         dc = np.where(self.c > 1e-4, (lit - 0.5) / C0, self.dc0).astype(np.float32)
-        sh = None if self.sh0 is None else (self.sh0 * f[:, None, :]).astype(np.float32)
+        if diffuse_only or self.sh0 is None:
+            return dc, None
+        sh = (self.sh0 * f[:, None, :]).astype(np.float32)
         return dc, sh
