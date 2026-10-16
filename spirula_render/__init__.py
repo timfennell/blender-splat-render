@@ -57,6 +57,10 @@ class SpirulaSettings(bpy.types.PropertyGroup):
         name="Reflections", default=True,
         description="Flat shiny meshes (floors, mirrors) reflect the splats in final renders, "
                     "as strongly as their material reflects (Cycles' glossy colour)")
+    use_mirror_light: bpy.props.BoolProperty(
+        name="Mirror Light", default=True,
+        description="Light bouncing off flat mirrors and polished metal lights the splats "
+                    "(each light's image in the mirror, shining through the mirror's outline)")
     shadow_softness: bpy.props.IntProperty(
         name="Softness", default=1, min=0, max=6,
         description="Shadow edge filter radius in shadow-map pixels")
@@ -106,6 +110,7 @@ class SPIRULA_PT_render(bpy.types.Panel):
         col = layout.column()
         col.active = s.use_meshes
         col.prop(s, "use_reflections")
+        col.prop(s, "use_mirror_light")
         cs = getattr(context.scene, "cycles", None)
         if cs is not None:
             col.prop(cs, "device", text="Mesh Device")

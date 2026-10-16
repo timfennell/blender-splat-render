@@ -434,6 +434,9 @@ class Relighter:
         if L["type"] == 'SUN':
             ldir = (-L["dir"] / np.linalg.norm(L["dir"])).astype(np.float32)
             e = np.full(len(self.means), gain * L["strength"], np.float32)
+            if "portal" in L:                     # light bounced off a mirror
+                from . import meshes
+                e = e * meshes.portal_mask(L["portal"], self.means, L)
             return np.broadcast_to(ldir, self.means.shape), e, self.centre + ldir * self.extent * 50, ldir
         d = (L["pos"][None, :] - self.means).astype(np.float32)
         dist = np.sqrt(np.einsum('ij,ij->i', d, d))
@@ -443,6 +446,9 @@ class Relighter:
             c = -(ldirs @ (L["dir"] / np.linalg.norm(L["dir"])).astype(np.float32))
             cos_out, cos_in = L["spot_cos"]
             e = e * np.clip((c - cos_out) / max(cos_in - cos_out, 1e-6), 0, 1)
+        if "portal" in L:                         # light bounced off a mirror
+            from . import meshes
+            e = e * meshes.portal_mask(L["portal"], self.means, L)
         mean_dir = L["pos"] - self.centre
         mean_dir = (mean_dir / max(np.linalg.norm(mean_dir), 1e-12)).astype(np.float32)
         return ldirs, e.astype(np.float32), L["pos"], mean_dir
@@ -467,14 +473,28 @@ class Relighter:
     mesh_points = None         # mesh surface points to find the splats' shadow at
     mesh_vis = None            # -> light name: light reaching each mesh point (after colours())
 
-    def _shadow(self, eye, shadows, shadow_res, softness, report, name):
+    def _tris_for(self, L):
+        """Mesh triangles that can block light L. Light bounced off a mirror comes from the
+        light's image behind it: only what's in front of the mirror (the room side) counts,
+        not the mirror itself."""
+        tris = self.mesh_tris
+        portal = L.get("portal")
+        if tris is None or portal is None:
+            return tris
+        s = (tris @ np.asarray(portal["n"], np.float32) - np.float32(portal["off"])) * \
+            np.float32(portal["side"])
+        keep = np.all(s > 1e-5 * max(self.extent, 1e-3), axis=1)
+        return tris[keep] if keep.any() else None
+
+    def _shadow(self, eye, shadows, shadow_res, softness, report, name, L=None):
         if not shadows:
             if self.mesh_points is not None:
                 self.mesh_vis[name] = np.ones(len(self.mesh_points), np.float32)
             return 1.0
         out = light_visibility(eye, self.centre, self.corners, self.means, self.opacity,
                                self.occluder_size, self.means, 2.0 * self.splat_size,
-                               shadow_res, softness, self.shadow_density, self.mesh_tris,
+                               shadow_res, softness, self.shadow_density,
+                               self._tris_for(L) if L is not None else self.mesh_tris,
                                self.mesh_points, 0.004 * self.extent)
         if self.mesh_points is None:
             return out
@@ -492,7 +512,7 @@ class Relighter:
             if shadows:
                 v = quick_light_visibility(eye, self.centre, self.corners, self.means,
                                            self.quick_width * self.extent, shadow_res,
-                                           self.shadow_density, self.mesh_tris,
+                                           self.shadow_density, self._tris_for(L),
                                            2.0 * self.splat_size, self.mesh_points)
                 if self.mesh_points is not None:
                     v, self.mesh_vis[L["name"]] = v
@@ -573,7 +593,7 @@ class Relighter:
             shine += ambient ** (1 / 2.2) * self.sh_at(v, 0, self.sh0.shape[1])
         for L in lights:
             ldirs, e, eye, _ = self._light_terms(L, gain)
-            vis = self._shadow(eye, shadows, shadow_res, softness, report, L["name"])
+            vis = self._shadow(eye, shadows, shadow_res, softness, report, L["name"], L)
             self.last_vis[L["name"]] = vis
             col = np.asarray(L["colour"], np.float32)[None, :]
             vis = np.broadcast_to(np.asarray(vis, np.float32), e.shape)

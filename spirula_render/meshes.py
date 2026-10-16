@@ -223,6 +223,8 @@ def prepare_cycles(scene, view_layer):
         _set(view_layer, "use_pass_position", True, store)
         _set(view_layer, "use_pass_diffuse_color", True, store)
         _set(view_layer, "use_pass_glossy_color", True, store)
+        _set(view_layer, "use_pass_glossy_direct", True, store)
+        _set(view_layer, "use_pass_glossy_indirect", True, store)
         _set(view_layer, "use_pass_object_index", True, store)
         for ob in scene.objects:
             if ob.type in GEOMETRY:
@@ -339,9 +341,46 @@ def _roughness(mat):
     return 0.5
 
 
+def _reflectance(mat):
+    """Normal-incidence reflectance (rgb) of a material: metals reflect their base colour,
+    other materials about 4%."""
+    nt = getattr(mat, "node_tree", None) if mat is not None else None
+    if nt is not None:
+        for node in nt.nodes:
+            if node.type == 'BSDF_PRINCIPLED':
+                bc, mt = node.inputs.get("Base Color"), node.inputs.get("Metallic")
+                base = np.array(bc.default_value[:3] if bc is not None and not bc.is_linked
+                                else (0.8, 0.8, 0.8), np.float64)
+                metal = float(mt.default_value) if mt is not None and not mt.is_linked else 0.0
+                return metal * base + (1 - metal) * 0.04
+    return np.full(3, 0.04)
+
+
+def _hull(pts):
+    """Convex hull of 2D points, counter-clockwise (monotone chain)."""
+    pts = sorted(set(map(tuple, np.round(pts, 9))))
+    if len(pts) < 3:
+        return np.array(pts)
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+    lower, upper = [], []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+    for p in reversed(pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+    return np.array(lower[:-1] + upper[:-1])
+
+
 def mirror_planes(depsgraph, limit=2):
-    """Flat polygon objects that may reflect the splats: [(normal, offset, roughness, name)],
-    largest first. How strongly each pixel reflects comes from Cycles' Glossy Color pass."""
+    """Flat polygon objects that may reflect the splats, largest first: dicts with the plane
+    (n, off), roughness, name, reflectance (rgb), and its outline as a convex polygon in the
+    plane (origin, u, v axes and 2D corners). How strongly each pixel reflects comes from
+    Cycles' Glossy Color pass; the outline and reflectance are for the light it bounces."""
     found = []
     for ob, M in mesh_instances(depsgraph):
         try:
@@ -354,7 +393,9 @@ def mirror_planes(depsgraph, limit=2):
                 continue
             co = np.empty(nv * 3, np.float32)
             me.vertices.foreach_get("co", co)
-            rough = _roughness(ob.material_slots[0].material if ob.material_slots else None)
+            mat = ob.material_slots[0].material if ob.material_slots else None
+            rough = _roughness(mat)
+            refl = _reflectance(mat)
         finally:
             ob.to_mesh_clear()
         P = co.reshape(-1, 3).astype(np.float64) @ M[:3, :3].T + M[:3, 3]
@@ -363,6 +404,73 @@ def mirror_planes(depsgraph, limit=2):
         if sv[0] <= 0 or sv[-1] / sv[0] > 1e-5:
             continue
         n = Vt[-1] / np.linalg.norm(Vt[-1])
-        found.append((sv[0] * sv[1], n, float(n @ c), rough, ob.name))
+        u, v = Vt[0], Vt[1]
+        hull = _hull(np.stack([(P - c) @ u, (P - c) @ v], 1))
+        found.append((sv[0] * sv[1], dict(n=n, off=float(n @ c), rough=rough, name=ob.name,
+                                          reflectance=refl, origin=c, u=u, v=v, outline=hull)))
     found.sort(key=lambda t: -t[0])
-    return [t[1:] for t in found[:limit]]
+    return [t[1] for t in found[:limit]]
+
+
+def mirror_lights(lights, mirrors, min_reflectance=0.2):
+    """Each light's image in each mirror (flat surface reflecting at least min_reflectance):
+    light that bounces off the mirror onto the splats. The image sits behind the mirror,
+    dimmed by its reflectance, and only shines through the mirror's outline (its "portal")."""
+    lum = np.array([0.2126, 0.7152, 0.0722])
+    out = []
+    for m in mirrors:
+        r = np.asarray(m["reflectance"], np.float64)
+        if float(r @ lum) < min_reflectance:
+            continue
+        n, off = np.asarray(m["n"], np.float64), m["off"]
+        for L in lights:
+            if "portal" in L:
+                continue
+            V = dict(L)
+            d = np.asarray(L["dir"], np.float64)
+            if L["type"] == 'SUN':
+                side = -float(n @ d)
+            else:
+                p = np.asarray(L["pos"], np.float64)
+                side = float(n @ p - off)
+                V["pos"] = p - 2 * side * n
+            if abs(side) < 1e-9:
+                continue
+            V["dir"] = d - 2 * float(n @ d) * n
+            V["colour"] = tuple(np.asarray(L["colour"], np.float64) * r)
+            V["name"] = f'{L["name"]} in {m["name"]}'
+            V["portal"] = dict(n=n, off=off, side=float(np.sign(side)), origin=m["origin"],
+                               u=m["u"], v=m["v"], outline=m["outline"])
+            out.append(V)
+    return out
+
+
+def portal_mask(portal, pts, light):
+    """Which points the light through a mirror reaches: on the mirror's lit side, with the
+    path from the light's image to them crossing the plane inside the mirror's outline."""
+    n = np.asarray(portal["n"], np.float32)
+    off = np.float32(portal["off"])
+    ok = (pts @ n - off) * np.float32(portal["side"]) > 0
+    if light["type"] == 'SUN':
+        back = -np.asarray(light["dir"], np.float32)          # towards the light's image
+        denom = float(back @ n)
+        if abs(denom) < 1e-9:
+            return np.zeros(len(pts), bool)
+        t = (off - pts @ n) / np.float32(denom)
+        X = pts + t[:, None] * back[None, :]
+    else:
+        q = np.asarray(light["pos"], np.float32)
+        d = pts - q[None, :]
+        denom = d @ n
+        t = (off - q @ n) / np.where(np.abs(denom) < 1e-12, np.float32(1e-12), denom)
+        ok &= (t > 0) & (t < 1)
+        X = q[None, :] + t[:, None] * d
+    rel = X - np.asarray(portal["origin"], np.float32)
+    a = rel @ np.asarray(portal["u"], np.float32)
+    b = rel @ np.asarray(portal["v"], np.float32)
+    hull = portal["outline"]
+    for i in range(len(hull)):
+        x0, y0 = hull[i]
+        x1, y1 = hull[(i + 1) % len(hull)]
+        ok &= (x1 - x0) * (b - y0) - (y1 - y0) * (a - x0) >= -1e-9
+    return ok

@@ -28,6 +28,10 @@ One final render, one point light at the front left:
 - **Splats shadow meshes:** both bees cast soft fur shadows across the floor.
 - **Splats shadow splats:** the left bee shades the right one, and each shades itself.
 - **Splats in a mirror:** the mirror shows the bees' backs, a side the camera can't see.
+- **Light off the mirror:** the lamp's light bounces off the mirror onto the bees' backs (Mirror
+  Light: each light's image behind a mirror or polished metal plane, shining through its outline,
+  shadowed by the splats and meshes in front of it). It lights the splats only; meshes get no
+  bounced light from mirrors.
 - **Splats in a glossy floor:** the bees are reflected, blurred by the floor's roughness.
 - **Meshes in meshes (Cycles):** the ball, slats and frame are reflected in the floor and the mirror.
 

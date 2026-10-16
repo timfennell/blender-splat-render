@@ -18,7 +18,7 @@ _LOCK = threading.RLock()
 _CACHE = {"key": None, "colour_key": None}
 # Mesh layer for the render in progress: triangles that cast shadows on the splats, and
 # the mesh surface points (one per pixel) the splats' shadows are wanted at.
-_MESH = {"tris": None, "points": None, "serial": 0}
+_MESH = {"tris": None, "points": None, "serial": 0, "mirrors": None}
 _SERIAL = itertools.count(1)
 
 
@@ -124,6 +124,9 @@ def _ensure_colours(depsgraph, obj, cam_world, settings, report, follow_camera=T
     _CACHE["relighter"].mesh_tris = _MESH["tris"]
     _CACHE["relighter"].mesh_points = _MESH["points"]
     lights = _object_space_lights(depsgraph, _IDENTITY)
+    if _MESH.get("mirrors") and getattr(settings, "use_mirror_light", True):
+        lights = lights + meshes.mirror_lights(lights, _MESH["mirrors"])
+    _CACHE["lights_used"] = lights
     Minv = _IDENTITY
     cam_pos = (Minv @ np.array(cam_world, np.float64)[:, 3])[:3].astype(np.float32)
     shadows = settings.use_shadows and (not viewport or settings.viewport_shadows) and not quick
@@ -203,13 +206,14 @@ def _render_view(depsgraph, settings, cam_world, V_of_world, fx, fy, cx, cy, W, 
     obj = None
     with _LOCK:
         if mesh is not None:
-            _MESH.update(tris=mesh[0], points=mesh[1], serial=mesh[2])
+            _MESH.update(tris=mesh[0], points=mesh[1], serial=mesh[2],
+                         mirrors=mesh[3] if len(mesh) > 3 else None)
         try:
             _upload_scene(splats, report)
             _ensure_colours(depsgraph, obj, cam_world, settings, report, follow_camera, quick,
                             viewport)
         finally:
-            _MESH.update(tris=None, points=None)
+            _MESH.update(tris=None, points=None, mirrors=None)
             if _CACHE.get("relighter") is not None:
                 _CACHE["relighter"].mesh_tris = _CACHE["relighter"].mesh_points = None
         rgb, alpha, d = native.render(V_of_world(), fx, fy, cx, cy, W, H, settings.primitive)
@@ -412,7 +416,7 @@ class SpirulaRenderEngine(bpy.types.RenderEngine):
         if getattr(self, "session", None):
             if settings.use_shadows:
                 tris = meshes.world_triangles(depsgraph)
-            if settings.use_reflections:
+            if settings.use_reflections or settings.use_mirror_light:
                 mirrors = meshes.mirror_planes(depsgraph)
         P = self._render_meshes(depsgraph)            # the depsgraph is gone after this
         if self.test_break():
@@ -429,7 +433,7 @@ class SpirulaRenderEngine(bpy.types.RenderEngine):
                            fx, fy, cx, cy, W, H, lambda m: self.report({'WARNING'}, m),
                            quick=False,
                            mesh=None if mesh is None else (mesh["tris"], mesh["points"],
-                                                           ("final", next(_SERIAL))))
+                                                           ("final", next(_SERIAL)), mirrors))
         mesh_vis = None
         if mesh is not None and _CACHE.get("relighter") is not None:
             mesh_vis = _CACHE["relighter"].mesh_vis
@@ -442,9 +446,10 @@ class SpirulaRenderEngine(bpy.types.RenderEngine):
             depth = np.where(alpha > 1e-3, d, np.inf).astype(np.float32)
             print(f"Spirula: {W}x{H} in {time.time() - t0:.2f}s")
 
-        if mesh is not None and out is not None and mirrors:
-            mesh["reflection"] = self._reflections(mesh, mirrors, cam_world, fx, fy, cx, cy, W, H,
-                                                   settings, _object_space_lights(frozen, _IDENTITY))
+        if mesh is not None and out is not None and mirrors and settings.use_reflections:
+            mesh["reflection"] = self._reflections(
+                mesh, mirrors, cam_world, fx, fy, cx, cy, W, H, settings,
+                _CACHE.get("lights_used") or _object_space_lights(frozen, _IDENTITY))
         rgba = np.concatenate([rgb, alpha[..., None]], -1)
         if mesh is not None:
             rgba, depth = self._composite(rgba, depth, mesh, mesh_vis, settings)
@@ -482,11 +487,17 @@ class SpirulaRenderEngine(bpy.types.RenderEngine):
         points = np.ascontiguousarray(pos[covered], np.float32) \
             if settings.use_shadows and settings.use_relight else None
         glossy = P.get("Glossy Color")
+        # share of each pixel that is reflection (what reflected splats can hide)
+        lum = np.array([0.2126, 0.7152, 0.0722], np.float32)
+        gl = sum(P[k][..., :3] for k in ("Glossy Direct", "Glossy Indirect") if k in P)
+        refl_share = None
+        if not np.isscalar(gl):
+            refl_share = np.clip((gl @ lum) / np.maximum(noisy @ lum, 1e-6), 0.0, 1.0)
         index = P.get("IndexOB", P.get("Object Index"))
         on_top = None if index is None else np.abs(index[..., 0] - meshes.ON_TOP_INDEX) < 0.5
         return dict(rgba=M, covered=covered, dist=dist, groups=groups, tris=tris, points=points,
                     pos=pos.astype(np.float32), glossy=None if glossy is None else glossy[..., :3],
-                    on_top=on_top,
+                    on_top=on_top, refl_share=refl_share,
                     noisy=noisy, rest=noisy - lights_sum, albedo=P.get("Diffuse Color"))
 
     def _reflections(self, mesh, mirrors, cam_world, fx, fy, cx, cy, W, H, settings, lights):
@@ -500,7 +511,8 @@ class SpirulaRenderEngine(bpy.types.RenderEngine):
         extent = _CACHE["relighter"].extent if _CACHE.get("relighter") is not None else 1.0
         total = np.zeros((H, W, 3), np.float32)
         cover = np.zeros((H, W), np.float32)
-        for n, off, rough, name in mirrors:
+        for m in mirrors:
+            n, off, rough, name = m["n"], m["off"], m["rough"], m["name"]
             on = cov & (np.abs(pos @ np.asarray(n, np.float32) - off) < 1e-4 * max(extent, 1e-3) + 1e-6)
             on &= gc.max(-1) > 1e-3
             if on.sum() < 16:
@@ -511,9 +523,13 @@ class SpirulaRenderEngine(bpy.types.RenderEngine):
             sigma = (1.0 + 60.0 * rough * rough) * W / 1920.0
             rgb, alpha = _blur(rgb, sigma), _blur(alpha[..., None], sigma)[..., 0]
             total[on] += gc[on] * rgb[on]
-            # the reflected splats hide what Cycles saw behind them in the reflection: as
-            # much of it as the surface's reflection makes up (all of it in a mirror)
-            share = np.clip(gc[on] @ np.array([0.2126, 0.7152, 0.0722], np.float32), 0.0, 1.0)
+            # the reflected splats hide what Cycles saw behind them in the reflection: the
+            # pixel's reflected share (Cycles' glossy light over its total; all of it in a
+            # mirror), as far as the splats cover it
+            if mesh.get("refl_share") is not None:
+                share = mesh["refl_share"][on]
+            else:
+                share = np.clip(gc[on] @ np.array([0.2126, 0.7152, 0.0722], np.float32), 0.0, 1.0)
             cover[on] = np.maximum(cover[on], share * alpha[on])
             print(f"Spirula: reflection in '{name}' in {time.time() - t:.2f}s")
         return total, cover
@@ -637,7 +653,8 @@ class SpirulaRenderEngine(bpy.types.RenderEngine):
                     points = np.ascontiguousarray(pos[covered][:, :3], np.float32)
                     if not len(points):
                         points, covered = None, None
-                mesh = (tris, points, ("viewport", mesh_key, view_key[0], next(_SERIAL)))
+                mirrors = meshes.mirror_planes(depsgraph) if settings.use_mirror_light else None
+                mesh = (tris, points, ("viewport", mesh_key, view_key[0], next(_SERIAL)), mirrors)
             try:
                 out = _render_view(depsgraph, settings, cam_world, lambda: V, fx, fy, cx, cy,
                                    W, H, lambda m: None, follow_camera=not quick, quick=quick,
