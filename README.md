@@ -26,7 +26,14 @@ Samples** points across the lens (Spirula panel, default 32) and average them, s
 blurs over what's behind it as a real lens would. Relighting is done once per frame; each sample
 is one more splat render (about 0.3 s for a 3M-splat model at 1080p). Meshes are rendered sharp by
 Cycles and moved to each lens point by their depth, so they blur with the splats and meet them
-correctly in every sample. The viewport doesn't show depth of field.
+correctly in every sample. The viewport doesn't show depth of field; the render window shows the
+blur building up every 8 samples.
+
+Blur depends on the scene's real size: Blender works out the lens opening from the focal length
+and f-stop in metres. A scan imported at its training scale (a 13 mm bee that is 13 units long)
+needs **Scene > Units > Unit Scale** set to its real size per unit (0.001 if a unit is a
+millimetre), or the lens is far too small to blur anything. Strong blur needs more samples
+(64-128) to stay smooth.
 
 ## Meshes alongside the splats
 

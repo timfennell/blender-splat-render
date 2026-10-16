@@ -589,6 +589,11 @@ class SpirulaRenderEngine(bpy.types.RenderEngine):
                     S = self._blend(S, dS, Mk, zk * ray, top_k)
                 acc += S
                 n_done += 1
+                if n_done % 8 == 0 and n_done < settings.dof_samples:
+                    # show the blur building up
+                    self._write((acc / n_done).astype(np.float32),
+                                np.minimum(depth, mesh["dist"]) if mesh is not None else depth,
+                                ray, film_transparent, world, W, H)
             if n_done:
                 rgba = (acc / n_done).astype(np.float32)
                 if mesh is not None:
