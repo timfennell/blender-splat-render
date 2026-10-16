@@ -36,6 +36,11 @@ class SpirulaSettings(bpy.types.PropertyGroup):
                     "Higher keeps iridescence but can show false colour where the capture never looked")
     use_shadows: bpy.props.BoolProperty(
         name="Shadows", default=True, description="The model casts shadows onto itself")
+    shadow_density: bpy.props.FloatProperty(
+        name="Shadow Density", default=4.0, min=1.0, soft_max=16.0,
+        description="How strongly splats block light, for shadows only. Scans often train thin walls "
+                    "semi-transparent (they look solid because the walls add up), which lets light leak "
+                    "through to the shadow side; raise this to stop the leak")
     viewport_shadows: bpy.props.BoolProperty(
         name="Viewport Shadows", default=False,
         description="Shadows in the viewport too (several seconds per light change on big scans; "
@@ -83,6 +88,7 @@ class SPIRULA_PT_render(bpy.types.Panel):
         col.prop(s, "use_shadows")
         sub = col.column()
         sub.active = s.use_shadows
+        sub.prop(s, "shadow_density")
         sub.prop(s, "viewport_shadows")
         sub.prop(s, "shadow_resolution")
         sub.prop(s, "shadow_softness")

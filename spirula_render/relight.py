@@ -94,6 +94,16 @@ class DeepShadow:
         order = np.argsort(key, kind="stable")
         self.key = key[order]
         self.cum = np.concatenate([[0.0], np.cumsum(np.log1p(-a[order]))])
+        # Exact coverage per pixel from the renderer itself (every splat's full footprint),
+        # seen from the light. The binned map above only knows each splat's centre pixel,
+        # which undercounts coverage through a thin shell; it is used for depth ORDER only.
+        self.gpu_T = None
+        try:
+            _, alpha, _, _ = native.render_ex(np.asarray(V, np.float32), f, f, res / 2, res / 2,
+                                              res, res, "3dgs")
+            self.gpu_T = np.clip(1.0 - alpha, 1e-6, 1.0).astype(np.float64)
+        except Exception:
+            pass
 
     def _project(self, pts):
         pc = pts @ self.V[:3, :3].T.astype(np.float32) + self.V[:3, 3].astype(np.float32)
@@ -101,6 +111,8 @@ class DeepShadow:
         u = self.f * pc[:, 0] / z + self.res / 2
         v = self.f * pc[:, 1] / z + self.res / 2
         return u, v, np.linalg.norm(pc, axis=1), z
+
+    density = 1.0              # optical depth multiplier for shadows (thin shells block more)
 
     def visibility(self, means, bias, radius=1):
         """Light reaching each splat centre, 0..1, averaged over nearby pixels for soft edges."""
@@ -115,12 +127,22 @@ class DeepShadow:
                 pix = (iv * self.res + iu).astype(np.float64)
                 start = np.searchsorted(self.key, pix, side="left")
                 stop = np.searchsorted(self.key, pix + d, side="left")
-                total += np.exp(self.cum[stop] - self.cum[start])
+                if self.gpu_T is None:
+                    total += np.exp(self.density * (self.cum[stop] - self.cum[start]))
+                else:
+                    end = np.searchsorted(self.key, pix + 1.0, side="left")
+                    before = self.cum[stop] - self.cum[start]          # <= 0
+                    whole = self.cum[end] - self.cum[start]            # <= 0
+                    # share of this column's occlusion that lies in front of the splat
+                    frac = np.where(whole < -1e-9, before / np.minimum(whole, -1e-9),
+                                    (stop > start).astype(np.float64))
+                    total += np.power(self.gpu_T[iv, iu], self.density * np.clip(frac, 0.0, 1.0))
                 taps += 1
         return (total / taps).astype(np.float32)
 
 
-def light_visibility(eye, target, corners, means, opacity, size, query, bias, res, softness):
+def light_visibility(eye, target, corners, means, opacity, size, query, bias, res, softness,
+                     density=1.0):
     """Light reaching each `query` splat from a light at `eye` (deep opacity shadows).
 
     One map aimed at the model when it fits in a reasonable field of view; otherwise
@@ -131,6 +153,7 @@ def light_visibility(eye, target, corners, means, opacity, size, query, bias, re
         t = float(np.max(np.abs(pc[:, :2]) / pc[:, 2:3]))
         if t < 1.6:                                  # under ~116 degrees: one map
             sm = DeepShadow(V, (res / 2) / (t * 1.05), res, means, opacity, size)
+            sm.density = density
             return sm.visibility(query, bias, softness)
     eye = np.asarray(eye, np.float64)
     rel_all = (means - eye).astype(np.float32)
@@ -153,6 +176,7 @@ def light_visibility(eye, target, corners, means, opacity, size, query, bias, re
             inside = (z > 1e-9) & (np.abs(pcs[:, 0]) <= 1.05 * z) & (np.abs(pcs[:, 1]) <= 1.05 * z)
             f = (res / 2) / 1.05
             sm = DeepShadow(Vf, f, res, means[inside], opacity[inside], size[inside])
+            sm.density = density
             vis[q] = sm.visibility(query[q], bias[q] if np.ndim(bias) else bias, softness)
     return vis
 
@@ -223,7 +247,7 @@ class Relighter:
             return 1.0
         return light_visibility(eye, self.centre, self.corners, self.means, self.opacity,
                                 self.occluder_size, self.means, 2.0 * self.splat_size,
-                                shadow_res, softness)
+                                shadow_res, softness, self.shadow_density)
 
     def quick_dc(self, lights, cam_pos, ambient, exposure):
         """Fast base-colour relight for dragging lights: diffuse only, no shadows, no SH,
@@ -238,6 +262,7 @@ class Relighter:
         return ((out - 0.5) / C0).astype(np.float32)
 
     shine_colour = 0.25        # 0: neutral (brightness only) ... 1: the full captured colour
+    shadow_density = 4.0       # see SpirulaSettings.shadow_density
 
     def shine_at(self, h):
         """The shine seen at half vector h: brightness from SH bands 2-3, colour from the full
@@ -285,11 +310,16 @@ class Relighter:
         for L in lights:
             ldirs, e, eye, _ = self._light_terms(L, gain)
             vis = self._shadow(eye, shadows, shadow_res, softness, report, L["name"])
-            w = (e * vis)[:, None] * np.asarray(L["colour"], np.float32)[None, :]
+            col = np.asarray(L["colour"], np.float32)[None, :]
+            vis = np.broadcast_to(np.asarray(vis, np.float32), e.shape)
+            w = (e * vis)[:, None] * col
             lin = lin + srgb_to_linear(self.diffuse_at(-ldirs)) * w
             if has_sh:
                 h = v - ldirs
                 h /= np.maximum(np.linalg.norm(h, axis=1, keepdims=True), 1e-12)
-                shine += np.power(np.maximum(w, 0), 1 / 2.2) * self.shine_at(h)
+                # The light's strength goes through the display curve; the shadow scales the
+                # highlight linearly (a curve on it would let 1% light through as 12%).
+                ws = np.power(np.maximum(e[:, None] * col, 0), 1 / 2.2) * vis[:, None]
+                shine += ws * self.shine_at(h)
         out = np.maximum(linear_to_srgb(lin) + shine, 0.0)
         return ((out - 0.5) / C0).astype(np.float32), None
