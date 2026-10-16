@@ -13,3 +13,14 @@ macOS (Apple Silicon). Splats only: meshes and lights are not rendered.
 
 The renderer library is built from a branch of Spirula Studio (`blender-render`, target
 `spirula_render`), which adds a small C interface (`src/blender/SplatRenderC.cpp`).
+
+## Building the renderer library
+
+`spirula_render/lib/libspirula_render.dylib` (shipped in the release zip) is built from
+[Spirula Studio](https://github.com/harry7557558/spirula-studio) (GPL-3.0) at the upstream commit in
+`spirula_patch/UPSTREAM_BASE.txt`, plus `spirula_patch/spirula-local-changes.patch` (which adds the C
+interface `src/blender/SplatRenderC.cpp` and the `spirula_render` CMake target). Build with
+`ninja spirula_render` in a Vulkan (MoltenVK) build of that tree, then copy the dylib into
+`spirula_render/lib/` and run `blender --command extension build --source-dir spirula_render`.
+
+License: GPL-3.0-or-later.
