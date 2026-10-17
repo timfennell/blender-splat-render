@@ -121,6 +121,8 @@ def _ensure_colours(depsgraph, obj, cam_world, settings, report, follow_camera=T
     if _CACHE.get("relighter") is None:
         _CACHE["relighter"] = relight.Relighter(d)
     _CACHE["relighter"].shine_colour = settings.shine_colour
+    # final renders spread shadows wider (steadier fur in animation, ~2x the shadow time)
+    _CACHE["relighter"].shadow_footprint = 1.0 if viewport else 1.5
     _CACHE["relighter"].shadow_density = settings.shadow_density
     _CACHE["relighter"].mesh_tris = _MESH["tris"]
     _CACHE["relighter"].mesh_points = _MESH["points"]

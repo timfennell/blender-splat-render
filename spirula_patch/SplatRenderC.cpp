@@ -14,8 +14,12 @@
 #include <engine/Engine.h>
 #include <engine/EngineState.h>
 
+#include "backend/vulkan/LensDefocus.h"
+#include "backend/vulkan/MetalInterop.h"
+
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <stdexcept>
 #include <string>
@@ -27,6 +31,22 @@ std::string g_error;
 int64_t g_num = 0;
 int g_degree = 0;
 int g_render_degree = -1;   // -1: render with all loaded SH bands
+
+// GPU frames a Metal host displays directly (sr_shared_frames).
+struct SharedFrame {
+    void* ptr;
+    int w, h;
+};
+std::vector<SharedFrame> g_frames;
+
+void free_frames() {
+    for (auto& f : g_frames) backend::device_free(f.ptr);
+    g_frames.clear();
+}
+
+// Thin-lens parameters on the GPU (sr_set_lens).
+void* g_lens = nullptr;
+constexpr size_t kLensFloat4s = 64;
 
 int render_degree() {
     return g_render_degree < 0 ? g_degree : std::min(g_render_degree, g_degree);
@@ -84,6 +104,11 @@ SR_API int sr_set_splats(int64_t num, int sh_degree, const float* means, const f
                       K > 0 ? ttv(features_sh, {num, K, 3}) : ttv_null());
         g_num = num;
         g_degree = sh_degree;
+        // Fixed small bins: the automatic choice starts at 64 px and only refines
+        // from training timings. SR_BIN_TILE (pixels, 0 = automatic) overrides.
+        int tile = 16;
+        if (const char* e = std::getenv("SR_BIN_TILE")) tile = std::atoi(e);
+        engine_set_bin_tile_size(tile);
     });
 }
 
@@ -162,6 +187,106 @@ SR_API int sr_render_ex(const float* viewmat, float fx, float fy, float cx, floa
 // fast interactive relight updates); -1 restores all loaded bands.
 SR_API void sr_set_render_degree(int degree) { g_render_degree = degree; }
 
-SR_API void sr_shutdown() { engine_reset(); g_num = 0; }
+// Zero-copy output for a Metal host: `count` more GPU frames of this size,
+// numbered from *first_index; layout and out_* as for sr_shared_frames.
+SR_API int sr_add_shared_frames(int width, int height, int count, void** out_buffers,
+                                size_t* out_offsets, int* first_index) {
+    return guarded([&] {
+        if (width <= 0 || height <= 0 || count <= 0)
+            throw std::runtime_error("bad frame size or count");
+        if (first_index) *first_index = (int)g_frames.size();
+        const size_t bytes = (size_t)width * height * 5 * sizeof(float);
+        for (int i = 0; i < count; i++) {
+            void* f = backend::device_malloc_checked(bytes, "shared frame");
+            g_frames.push_back({f, width, height});
+            size_t off = 0;
+            void* mtl = backend::vk::metal_buffer_for(f, &off);
+            if (!mtl) throw std::runtime_error("the GPU cannot share buffers with Metal (needs MoltenVK)");
+            out_buffers[i] = mtl;
+            out_offsets[i] = off;
+        }
+    });
+}
+
+// Replaces all shared frames with `count` new ones: W*H float3 rgb, then W*H
+// transmittance, then W*H median depth; out_buffers[i] = unretained
+// id<MTLBuffer> (valid until freed / sr_shutdown) at out_offsets[i].
+SR_API int sr_shared_frames(int width, int height, int count, void** out_buffers,
+                            size_t* out_offsets) {
+    backend::device_synchronize();
+    free_frames();
+    return sr_add_shared_frames(width, height, count, out_buffers, out_offsets, nullptr);
+}
+
+// Render one pinhole view into shared frame `frame` (at that frame's size) and
+// wait for the GPU to finish, so the host may read it right after.
+SR_API int sr_render_to_frame(int frame, const float* viewmat, float fx, float fy, float cx,
+                              float cy, const char* primitive) {
+    return guarded([&] {
+        if (g_num <= 0) throw std::runtime_error("no splats loaded");
+        if (frame < 0 || frame >= (int)g_frames.size())
+            throw std::runtime_error("no such shared frame");
+        const int width = g_frames[frame].w, height = g_frames[frame].h;
+        const std::vector<float> intr = {fx, fy, cx, cy};
+        const std::vector<float> dist(kCameraDistortionParams, 0.0f);
+        set_camera_params(width, height, "PINHOLE", "NONE", ttv(viewmat, {1, 4, 4}),
+                          ttv(intr.data(), {1, 4}),
+                          ttv(dist.data(), {1, kCameraDistortionParams}));
+        forward_3dgs(primitive ? primitive : "3dgs", render_degree(), false, true, 0);
+        const size_t px = (size_t)width * height;
+        auto* dst = (char*)g_frames[frame].ptr;
+        auto& rgb = std::get<0>(engine().fwd.renders);
+        auto& Ts = engine().fwd.render_Ts;
+        auto& median = engine().fwd.render_median;
+        if (!rgb.data_ptr() || !Ts.data_ptr() || !median.data_ptr())
+            throw std::runtime_error("render produced no image");
+        backend::memcpy_async(dst, rgb.data_ptr(), px * 3 * sizeof(float),
+                              backend::MemcpyKind::DeviceToDevice);
+        backend::memcpy_async(dst + px * 3 * sizeof(float), Ts.data_ptr(), px * sizeof(float),
+                              backend::MemcpyKind::DeviceToDevice);
+        backend::memcpy_async(dst + px * 4 * sizeof(float), median.data_ptr(), px * sizeof(float),
+                              backend::MemcpyKind::DeviceToDevice);
+        backend::device_synchronize();
+    });
+}
+
+// Depth of field inside the render: `count` float4s laid out as in
+// docs/notes/lens-defocus.md, or null for a pinhole. Applies to later renders.
+SR_API int sr_set_lens(const float* params, int count) {
+    return guarded([&] {
+        if (!params || count <= 0) {
+            backend::vk::set_lens_defocus(nullptr);
+            return;
+        }
+        if ((size_t)count > kLensFloat4s) throw std::runtime_error("lens table too long");
+        if (!g_lens) g_lens = backend::device_malloc_checked(kLensFloat4s * 16, "lens");
+        backend::memcpy_sync(g_lens, params, (size_t)count * 16, backend::MemcpyKind::HostToDevice);
+        backend::vk::set_lens_defocus(g_lens);
+    });
+}
+
+// The splats' SH DC colours [N,3] fp32 on the GPU, for a Metal host to relight
+// in place (render with sr_set_render_degree(0) after): unretained
+// id<MTLBuffer> and the byte offset of the colours inside it.
+SR_API int sr_color_buffer(void** out_buffer, size_t* out_offset) {
+    return guarded([&] {
+        if (g_num <= 0) throw std::runtime_error("no splats loaded");
+        void* p = engine().world.features_dc.data_ptr();
+        size_t off = 0;
+        void* mtl = p ? backend::vk::metal_buffer_for(p, &off) : nullptr;
+        if (!mtl) throw std::runtime_error("the colours cannot be shared with Metal");
+        *out_buffer = mtl;
+        *out_offset = off;
+    });
+}
+
+SR_API void sr_shutdown() {
+    backend::vk::set_lens_defocus(nullptr);
+    if (g_lens) backend::device_free(g_lens);
+    g_lens = nullptr;
+    free_frames();
+    engine_reset();
+    g_num = 0;
+}
 
 }  // extern "C"

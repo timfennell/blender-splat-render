@@ -136,6 +136,42 @@ index 00000000..1a27874a
 +For a masked insect: random background, empty- and solid-area alpha weights
 +0.5, a small opacity regularization (0.001), SH degree 3, and full checkpoints
 +so the run can be paused and resumed around the void editing.
+diff --git a/docs/notes/lens-defocus.md b/docs/notes/lens-defocus.md
+new file mode 100644
+index 00000000..bb8feeb1
+--- /dev/null
++++ b/docs/notes/lens-defocus.md
+@@ -0,0 +1,30 @@
++# Thin-lens depth of field inside the projection
++
++`sr_set_lens` turns the pinhole projection into a thin lens for viewer renders
++(`apply_lens` in `src/backend/vulkan/shaders/projection_fwd.slang`).
++
++A lens point `d` (camera x/y, scene units), with the view sheared so the focus
++plane at distance `s` stays put, moves a point at depth `z` on the image by
++`f * d * (1/s - 1/z)` pixels (`f` = fx, fy). Over the whole pupil, a splat's
++image therefore moves by `f k mu` and spreads by `(f k)^2 Sigma`, with
++`k = 1/s - 1/z` and `mu`, `Sigma` the pupil's mean and covariance. Each splat
++gets that shift, that covariance added to its 2D footprint, opacity scaled by
++`sqrt(det before / det after)` (same energy, spread wider) and its colour by
++the pupil's light transmission. Occlusion stays exact: the blurred splats are
++still sorted and alpha-blended.
++
++Rendering several sub-pupils (cells) with the view sheared to each cell's
++centre and only the cell's own spread as blur converges to the exact lens:
++one cell is a live preview, dozens give the true bokeh shape.
++
++Layout (float4s):
++
++| index | contents |
++|---|---|
++| 0 | (on, 1/focus distance, aperture radius, 1 = moments from the table / 0 = isotropic) |
++| 1 | (isotropic variance in radius^2 units, -, -, max blur sigma in pixels) |
++| 2..33 | pupil at field radius `|q| = i/31 * 1.25` (q = 1 at the frame corner): (mean along q, variance along q, variance across q, light), in aperture radii |
++
++Mechanical vignetting clips off-axis pupils into cat's eyes: the table's
++anisotropic variance and mean shift are what make off-axis bokeh stretch
++and swirl.
 diff --git a/docs/notes/training-capture.md b/docs/notes/training-capture.md
 new file mode 100644
 index 00000000..4cc5312b
@@ -2531,6 +2567,152 @@ index 00000000..0a255e36
 +}
 +
 +}  // namespace backend
+diff --git a/src/backend/vulkan/LensDefocus.h b/src/backend/vulkan/LensDefocus.h
+new file mode 100644
+index 00000000..db5034ae
+--- /dev/null
++++ b/src/backend/vulkan/LensDefocus.h
+@@ -0,0 +1,12 @@
++#pragma once
++// Thin-lens depth of field inside the 3DGS projection (projection_fwd.slang,
++// apply_lens): a device buffer of float4 lens parameters, or null for a pinhole.
++// Process-wide, for viewer renders only; training never sets it.
++
++namespace backend {
++namespace vk {
++
++void set_lens_defocus(const void* device_params);
++
++}  // namespace vk
++}  // namespace backend
+diff --git a/src/backend/vulkan/MetalInterop.cpp b/src/backend/vulkan/MetalInterop.cpp
+new file mode 100644
+index 00000000..8a4d4a21
+--- /dev/null
++++ b/src/backend/vulkan/MetalInterop.cpp
+@@ -0,0 +1,40 @@
++// See MetalInterop.h.
++
++#include "backend/vulkan/MetalInterop.h"
++
++#include "backend/vulkan/VulkanInternal.h"
++
++#if defined(__APPLE__)
++#include <vulkan/vulkan_metal.h>
++#endif
++
++namespace backend {
++namespace vk {
++
++void* metal_buffer_for(const void* device_ptr, size_t* offset) {
++#if defined(__APPLE__)
++    Allocation alloc;
++    VkDeviceSize off = 0;
++    bool is_device = false;
++    if (!resolve_pointer(device_ptr, &alloc, &off, &is_device) || !is_device)
++        return nullptr;
++    VkDevice dev = Context::get().device();
++    auto fn = (PFN_vkExportMetalObjectsEXT)vkGetDeviceProcAddr(
++        dev, "vkExportMetalObjectsEXT");
++    if (!fn) return nullptr;
++    VkExportMetalBufferInfoEXT buf{VK_STRUCTURE_TYPE_EXPORT_METAL_BUFFER_INFO_EXT};
++    buf.memory = alloc.memory;
++    VkExportMetalObjectsInfoEXT info{VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT};
++    info.pNext = &buf;
++    fn(dev, &info);
++    if (offset) *offset = (size_t)off;
++    return (void*)buf.mtlBuffer;
++#else
++    (void)device_ptr;
++    (void)offset;
++    return nullptr;
++#endif
++}
++
++}  // namespace vk
++}  // namespace backend
+diff --git a/src/backend/vulkan/MetalInterop.h b/src/backend/vulkan/MetalInterop.h
+new file mode 100644
+index 00000000..1739ec0b
+--- /dev/null
++++ b/src/backend/vulkan/MetalInterop.h
+@@ -0,0 +1,16 @@
++#pragma once
++// Zero-copy display on Apple platforms: the Metal buffer behind a device
++// allocation (MoltenVK's VK_EXT_metal_objects). A host app that renders with
++// Metal reads it directly, on the same GPU, with no CPU readback.
++
++#include <cstddef>
++
++namespace backend {
++namespace vk {
++
++// Unretained id<MTLBuffer> behind the device_malloc allocation holding
++// `device_ptr` (+ its byte offset inside); null off MoltenVK.
++void* metal_buffer_for(const void* device_ptr, size_t* offset);
++
++}  // namespace vk
++}  // namespace backend
+diff --git a/src/backend/vulkan/VulkanContext.cpp b/src/backend/vulkan/VulkanContext.cpp
+index c6a86710..1c010f69 100644
+--- a/src/backend/vulkan/VulkanContext.cpp
++++ b/src/backend/vulkan/VulkanContext.cpp
+@@ -517,6 +517,12 @@ void Context::init() {
+         _caps.memory_budget = true;
+     }
+ 
++    // VK_EXT_metal_objects (MoltenVK): hands a host app the MTLBuffer behind
++    // a device allocation, so it can display renders without a CPU readback
++    // (backend/vulkan/MetalInterop.h).
++    if (has_extension(_physical, "VK_EXT_metal_objects"))
++        extensions.push_back("VK_EXT_metal_objects");
++
+     // Pin the compute subgroup size when the device lets us (see
+     // Capabilities::required_subgroup_size).
+     VkPhysicalDeviceSubgroupSizeControlFeaturesEXT fsgc{
+diff --git a/src/backend/vulkan/kernels/ProjectionFwd.cpp b/src/backend/vulkan/kernels/ProjectionFwd.cpp
+index ae0d78b6..e03ed10d 100644
+--- a/src/backend/vulkan/kernels/ProjectionFwd.cpp
++++ b/src/backend/vulkan/kernels/ProjectionFwd.cpp
+@@ -9,6 +9,8 @@
+ 
+ namespace {
+ 
++uint64_t g_lens_defocus = 0;   // backend/vulkan/LensDefocus.h
++
+ // Mirrors ProjectionFwdParams in shaders/projection_fwd.slang.
+ struct ProjectionFwdParams {
+     uint64_t means, quats, scales, opacities, features_dc, features_sh;
+@@ -23,8 +25,9 @@ struct ProjectionFwdParams {
+     uint32_t wgs_per_row;
+     uint32_t num_sh_buffer;
+     uint32_t _pad0;
++    uint64_t lens;
+ };
+-static_assert(sizeof(ProjectionFwdParams) == 16 * 8 + 8 * 4,
++static_assert(sizeof(ProjectionFwdParams) == 17 * 8 + 8 * 4,
+               "params layout must match the slang struct");
+ 
+ // Mirrors Projection3dgutParams in shaders/projection_fwd.slang.
+@@ -117,6 +120,7 @@ launch_projection_fwd_vk(
+     p.width = image_width;
+     p.height = image_height;
+     p.wgs_per_row = per_row;
++    p.lens = g_lens_defocus;
+ 
+     backend::vk::SpecList spec{cd.cam, (uint32_t)sh_degree,
+                                antialiased ? 1u : 0u, spec_bits, 0u, cd.dist};
+@@ -128,6 +132,10 @@ launch_projection_fwd_vk(
+ 
+ }  // namespace
+ 
++namespace backend::vk {
++void set_lens_defocus(const void* device_params) { g_lens_defocus = (uint64_t)device_params; }
++}  // namespace backend::vk
++
+ /* API definitions matching kernels/projection/ProjectionFwd.cuh */
+ 
+ std::tuple<
 diff --git a/src/backend/vulkan/kernels/RasterizeFwd.cpp b/src/backend/vulkan/kernels/RasterizeFwd.cpp
 index ef7b72da..9f612088 100644
 --- a/src/backend/vulkan/kernels/RasterizeFwd.cpp
@@ -2602,6 +2784,86 @@ index ef7b72da..9f612088 100644
      dispatch_raster("rasterize_fwd.rasterize_fwd_3dgut", spec,
                      (uint32_t)batch, tile_width, tile_height, macro_log2, &p,
                      sizeof(p));
+diff --git a/src/backend/vulkan/shaders/projection_fwd.slang b/src/backend/vulkan/shaders/projection_fwd.slang
+index 9c30e617..32efd058 100644
+--- a/src/backend/vulkan/shaders/projection_fwd.slang
++++ b/src/backend/vulkan/shaders/projection_fwd.slang
+@@ -93,8 +93,62 @@ struct ProjectionFwdParams {
+     uint32_t wgs_per_row; // grid fold (flat id = wg.y * wgs_per_row*128 + x)
+     uint32_t num_sh_buffer;
+     uint32_t _pad0;
++    float4* lens;         // thin-lens defocus (apply_lens); null = pinhole
+ };
+ 
++// Thin-lens depth of field inside the render; layout of L in
++// docs/notes/lens-defocus.md. Pupil mean / covariance -> splat shift / blur.
++static const int kLensTable = 32;
++
++bool apply_lens(float4* L, float3 mean_c, float fx, float fy, uint W, uint H,
++                inout float2 xy, inout float3 conic, inout float opac,
++                inout float4 aabb, inout float3 rgb) {
++    float4 L0 = L[0];
++    float k = L0.y - 1.0f / mean_c.z;
++    float2 half_size = float2(W, H) * 0.5f;
++    float2 qv = (xy - half_size) / length(half_size);
++    float ql = length(qv);
++    float2 qd = ql > 1e-4f ? qv / ql : float2(1, 0);
++    float a2 = L0.z * L0.z;
++    float2 mu = 0;
++    float2x2 S;
++    float light = 1;
++    if (L0.w > 0.5f) {
++        float t = clamp(ql / 1.25f, 0.0f, 1.0f) * float(kLensTable - 1);
++        int i0 = min(int(t), kLensTable - 2);
++        float4 m = lerp(L[2 + i0], L[3 + i0], t - float(i0));
++        mu = qd * (m.x * L0.z);
++        float2 qp = float2(-qd.y, qd.x);
++        S = (m.y * a2) * float2x2(qd.x * qd.x, qd.x * qd.y, qd.x * qd.y, qd.y * qd.y) +
++            (m.z * a2) * float2x2(qp.x * qp.x, qp.x * qp.y, qp.x * qp.y, qp.y * qp.y);
++        light = m.w;
++    } else {
++        S = float2x2(L[1].x * a2, 0, 0, L[1].x * a2);
++    }
++    float2 f = float2(fx, fy) * k;
++    float2x2 B = float2x2(f.x * f.x * S[0][0], f.x * f.y * S[0][1],
++                          f.x * f.y * S[1][0], f.y * f.y * S[1][1]);
++    // Cap the blur so a wildly defocused splat cannot cover the whole frame.
++    float maxv = L[1].w * L[1].w;
++    float tr = B[0][0] + B[1][1];
++    if (tr > 2 * maxv) B *= 2 * maxv / tr;
++    float2x2 C = inverse(float2x2(conic.x, conic.y, conic.y, conic.z));
++    float det0 = determinant(C);
++    C += B;
++    float det1 = determinant(C);
++    if (!(det1 > 0)) return false;
++    opac *= sqrt(max(det0, 0.0f) / det1);   // same energy, spread wider
++    if (opac < ALPHA_THRESHOLD) return false;
++    float2x2 Ci = inverse(C);
++    conic = float3(Ci[0][0], Ci[0][1], Ci[1][1]);
++    xy += f * mu;
++    rgb *= light;
++    float extend = min(3.33f, sqrt(2.0f * log(opac / ALPHA_THRESHOLD)));
++    float rx = extend * sqrt(C[0][0]), ry = extend * sqrt(C[1][1]);
++    aabb = float4(xy.x - rx, xy.y - ry, xy.x + rx, xy.y + ry);
++    return !(aabb.z <= 0 || aabb.x >= float(W) || aabb.w <= 0 || aabb.y >= float(H));
++}
++
+ void run_projection<let cam: CameraModelType, D : ICameraDistortion>(
+     ProjectionFwdParams p, uint idx) {
+     uint cid = (idx / p.N) % p.C;
+@@ -143,6 +197,12 @@ void run_projection<let cam: CameraModelType, D : ICameraDistortion>(
+         rgb = eval_splat_color(mean, R, t, dc, p.features_sh, p.sh_stride,
+                                gid, p.sh_packed, p.sh_bounds,
+                                p.num_sh_buffer, i64mem_get(p.sh_bounds_stride));
++    if (!is_null(p.lens) && aabb.z > aabb.x && aabb.w > aabb.y && p.lens[0].x > 0.5f) {
++        float3 mean_c = mul(R, mean) + t;
++        if (!apply_lens(p.lens, mean_c, intrin.x, intrin.y, p.width, p.height,
++                        s_xy, s_conic, s_opac, aabb, rgb))
++            aabb = float4(0.0f);
++    }
+ 
+     // store (mirrors the kernel epilogue: clamp, degenerate cull, atomics)
+     aabb.x = clamp(aabb.x, 0.0f, float(p.width) - 1.0f);
 diff --git a/src/backend/vulkan/shaders/rasterize_fwd.slang b/src/backend/vulkan/shaders/rasterize_fwd.slang
 index 16a25dd5..40378811 100644
 --- a/src/backend/vulkan/shaders/rasterize_fwd.slang
@@ -2663,10 +2925,10 @@ index 16a25dd5..40378811 100644
              float2 delta = float2(f.xy.x - px, f.xy.y - py);
 diff --git a/src/blender/SplatRenderC.cpp b/src/blender/SplatRenderC.cpp
 new file mode 100644
-index 00000000..678744d5
+index 00000000..dd88d8cd
 --- /dev/null
 +++ b/src/blender/SplatRenderC.cpp
-@@ -0,0 +1,167 @@
+@@ -0,0 +1,292 @@
 +// A C interface to Spirula's 3DGS renderer, for loading into another process
 +// (the Blender render engine add-on calls it through ctypes).
 +//
@@ -2683,8 +2945,12 @@ index 00000000..678744d5
 +#include <engine/Engine.h>
 +#include <engine/EngineState.h>
 +
++#include "backend/vulkan/LensDefocus.h"
++#include "backend/vulkan/MetalInterop.h"
++
 +#include <algorithm>
 +#include <cstdint>
++#include <cstdlib>
 +#include <exception>
 +#include <stdexcept>
 +#include <string>
@@ -2696,6 +2962,22 @@ index 00000000..678744d5
 +int64_t g_num = 0;
 +int g_degree = 0;
 +int g_render_degree = -1;   // -1: render with all loaded SH bands
++
++// GPU frames a Metal host displays directly (sr_shared_frames).
++struct SharedFrame {
++    void* ptr;
++    int w, h;
++};
++std::vector<SharedFrame> g_frames;
++
++void free_frames() {
++    for (auto& f : g_frames) backend::device_free(f.ptr);
++    g_frames.clear();
++}
++
++// Thin-lens parameters on the GPU (sr_set_lens).
++void* g_lens = nullptr;
++constexpr size_t kLensFloat4s = 64;
 +
 +int render_degree() {
 +    return g_render_degree < 0 ? g_degree : std::min(g_render_degree, g_degree);
@@ -2753,6 +3035,11 @@ index 00000000..678744d5
 +                      K > 0 ? ttv(features_sh, {num, K, 3}) : ttv_null());
 +        g_num = num;
 +        g_degree = sh_degree;
++        // Fixed small bins: the automatic choice starts at 64 px and only refines
++        // from training timings. SR_BIN_TILE (pixels, 0 = automatic) overrides.
++        int tile = 16;
++        if (const char* e = std::getenv("SR_BIN_TILE")) tile = std::atoi(e);
++        engine_set_bin_tile_size(tile);
 +    });
 +}
 +
@@ -2831,7 +3118,107 @@ index 00000000..678744d5
 +// fast interactive relight updates); -1 restores all loaded bands.
 +SR_API void sr_set_render_degree(int degree) { g_render_degree = degree; }
 +
-+SR_API void sr_shutdown() { engine_reset(); g_num = 0; }
++// Zero-copy output for a Metal host: `count` more GPU frames of this size,
++// numbered from *first_index; layout and out_* as for sr_shared_frames.
++SR_API int sr_add_shared_frames(int width, int height, int count, void** out_buffers,
++                                size_t* out_offsets, int* first_index) {
++    return guarded([&] {
++        if (width <= 0 || height <= 0 || count <= 0)
++            throw std::runtime_error("bad frame size or count");
++        if (first_index) *first_index = (int)g_frames.size();
++        const size_t bytes = (size_t)width * height * 5 * sizeof(float);
++        for (int i = 0; i < count; i++) {
++            void* f = backend::device_malloc_checked(bytes, "shared frame");
++            g_frames.push_back({f, width, height});
++            size_t off = 0;
++            void* mtl = backend::vk::metal_buffer_for(f, &off);
++            if (!mtl) throw std::runtime_error("the GPU cannot share buffers with Metal (needs MoltenVK)");
++            out_buffers[i] = mtl;
++            out_offsets[i] = off;
++        }
++    });
++}
++
++// Replaces all shared frames with `count` new ones: W*H float3 rgb, then W*H
++// transmittance, then W*H median depth; out_buffers[i] = unretained
++// id<MTLBuffer> (valid until freed / sr_shutdown) at out_offsets[i].
++SR_API int sr_shared_frames(int width, int height, int count, void** out_buffers,
++                            size_t* out_offsets) {
++    backend::device_synchronize();
++    free_frames();
++    return sr_add_shared_frames(width, height, count, out_buffers, out_offsets, nullptr);
++}
++
++// Render one pinhole view into shared frame `frame` (at that frame's size) and
++// wait for the GPU to finish, so the host may read it right after.
++SR_API int sr_render_to_frame(int frame, const float* viewmat, float fx, float fy, float cx,
++                              float cy, const char* primitive) {
++    return guarded([&] {
++        if (g_num <= 0) throw std::runtime_error("no splats loaded");
++        if (frame < 0 || frame >= (int)g_frames.size())
++            throw std::runtime_error("no such shared frame");
++        const int width = g_frames[frame].w, height = g_frames[frame].h;
++        const std::vector<float> intr = {fx, fy, cx, cy};
++        const std::vector<float> dist(kCameraDistortionParams, 0.0f);
++        set_camera_params(width, height, "PINHOLE", "NONE", ttv(viewmat, {1, 4, 4}),
++                          ttv(intr.data(), {1, 4}),
++                          ttv(dist.data(), {1, kCameraDistortionParams}));
++        forward_3dgs(primitive ? primitive : "3dgs", render_degree(), false, true, 0);
++        const size_t px = (size_t)width * height;
++        auto* dst = (char*)g_frames[frame].ptr;
++        auto& rgb = std::get<0>(engine().fwd.renders);
++        auto& Ts = engine().fwd.render_Ts;
++        auto& median = engine().fwd.render_median;
++        if (!rgb.data_ptr() || !Ts.data_ptr() || !median.data_ptr())
++            throw std::runtime_error("render produced no image");
++        backend::memcpy_async(dst, rgb.data_ptr(), px * 3 * sizeof(float),
++                              backend::MemcpyKind::DeviceToDevice);
++        backend::memcpy_async(dst + px * 3 * sizeof(float), Ts.data_ptr(), px * sizeof(float),
++                              backend::MemcpyKind::DeviceToDevice);
++        backend::memcpy_async(dst + px * 4 * sizeof(float), median.data_ptr(), px * sizeof(float),
++                              backend::MemcpyKind::DeviceToDevice);
++        backend::device_synchronize();
++    });
++}
++
++// Depth of field inside the render: `count` float4s laid out as in
++// docs/notes/lens-defocus.md, or null for a pinhole. Applies to later renders.
++SR_API int sr_set_lens(const float* params, int count) {
++    return guarded([&] {
++        if (!params || count <= 0) {
++            backend::vk::set_lens_defocus(nullptr);
++            return;
++        }
++        if ((size_t)count > kLensFloat4s) throw std::runtime_error("lens table too long");
++        if (!g_lens) g_lens = backend::device_malloc_checked(kLensFloat4s * 16, "lens");
++        backend::memcpy_sync(g_lens, params, (size_t)count * 16, backend::MemcpyKind::HostToDevice);
++        backend::vk::set_lens_defocus(g_lens);
++    });
++}
++
++// The splats' SH DC colours [N,3] fp32 on the GPU, for a Metal host to relight
++// in place (render with sr_set_render_degree(0) after): unretained
++// id<MTLBuffer> and the byte offset of the colours inside it.
++SR_API int sr_color_buffer(void** out_buffer, size_t* out_offset) {
++    return guarded([&] {
++        if (g_num <= 0) throw std::runtime_error("no splats loaded");
++        void* p = engine().world.features_dc.data_ptr();
++        size_t off = 0;
++        void* mtl = p ? backend::vk::metal_buffer_for(p, &off) : nullptr;
++        if (!mtl) throw std::runtime_error("the colours cannot be shared with Metal");
++        *out_buffer = mtl;
++        *out_offset = off;
++    });
++}
++
++SR_API void sr_shutdown() {
++    backend::vk::set_lens_defocus(nullptr);
++    if (g_lens) backend::device_free(g_lens);
++    g_lens = nullptr;
++    free_frames();
++    engine_reset();
++    g_num = 0;
++}
 +
 +}  // extern "C"
 diff --git a/src/blender/exports.map b/src/blender/exports.map
@@ -2846,10 +3233,10 @@ index 00000000..c26317d3
 +};
 diff --git a/src/blender/exports.txt b/src/blender/exports.txt
 new file mode 100644
-index 00000000..5b876c3b
+index 00000000..bcf61824
 --- /dev/null
 +++ b/src/blender/exports.txt
-@@ -0,0 +1,7 @@
+@@ -0,0 +1,12 @@
 +_sr_last_error
 +_sr_set_splats
 +_sr_render
@@ -2857,6 +3244,11 @@ index 00000000..5b876c3b
 +_sr_set_colors
 +_sr_shutdown
 +_sr_set_render_degree
++_sr_shared_frames
++_sr_render_to_frame
++_sr_set_lens
++_sr_add_shared_frames
++_sr_color_buffer
 diff --git a/src/config/TrainConfig.h b/src/config/TrainConfig.h
 index 04df5cd5..70178fb3 100644
 --- a/src/config/TrainConfig.h

@@ -70,13 +70,29 @@ def look_at(eye, target, up_hint=(0.0, 0.0, 1.0)):
 def _bilinear(u, v, res):
     """The four pixels around continuous pixel coordinates u, v and their weights:
     (iu [N,4], iv [N,4], w [N,4]). Pixel i covers [i, i+1); its centre is i + 0.5."""
+    return _footprint(u, v, res, 1.0)
+
+
+def _footprint(u, v, res, radius):
+    """Pixels within `radius` of (u, v) and tent weights (1 - distance / radius per axis),
+    normalised: (iu, iv, w), each [N, k*k]. radius 1 is bilinear (2x2); 1.5 spreads over
+    3x3, a wider filter. Continuous in u, v: a pixel enters or leaves at zero weight."""
+    n_ax = 2 if radius <= 1.0 else 3
     x, y = u - 0.5, v - 0.5
-    x0, y0 = np.floor(x), np.floor(y)
-    fx, fy = (x - x0).astype(np.float32), (y - y0).astype(np.float32)
-    x0, y0 = x0.astype(np.int64), y0.astype(np.int64)
-    iu = np.stack([x0, x0 + 1, x0, x0 + 1], 1)
-    iv = np.stack([y0, y0, y0 + 1, y0 + 1], 1)
-    w = np.stack([(1 - fx) * (1 - fy), fx * (1 - fy), (1 - fx) * fy, fx * fy], 1)
+    if n_ax == 2:
+        bx, by = np.floor(x), np.floor(y)
+    else:
+        bx, by = np.floor(x) - 1 + (x - np.floor(x) >= 0.5), np.floor(y) - 1 + (y - np.floor(y) >= 0.5)
+    offs = np.arange(n_ax)
+    cx = bx[:, None] + offs[None, :]                              # [N, n] tap pixel indices
+    cy = by[:, None] + offs[None, :]
+    wx = np.maximum(1.0 - np.abs(x[:, None] - cx) / radius, 0.0)
+    wy = np.maximum(1.0 - np.abs(y[:, None] - cy) / radius, 0.0)
+    wx /= np.maximum(wx.sum(1, keepdims=True), 1e-12)
+    wy /= np.maximum(wy.sum(1, keepdims=True), 1e-12)
+    iu = np.repeat(cx, n_ax, 1).astype(np.int64)                  # [N, n*n]: x fastest inner? (y-major)
+    iv = np.tile(cy, (1, n_ax)).astype(np.int64)
+    w = (np.repeat(wx, n_ax, 1) * np.tile(wy, (1, n_ax))).astype(np.float32)
     return np.clip(iu, 0, res - 1), np.clip(iv, 0, res - 1), w
 
 
@@ -95,7 +111,9 @@ class DeepShadow:
     shadow over gradually instead of all at once, which showed as jittering fur.
     """
 
-    def __init__(self, V, f, res, means, opacity, size):
+    footprint = 1.0            # pixels each splat is shared over (1 bilinear, 1.5 = 3x3)
+
+    def __init__(self, V, f, res, means, opacity, size, footprint=None):
         """V: world->light camera (OpenCV axes), f: focal length in pixels. Every splat
         given here must be in front of the light and inside its view."""
         self.V, self.f, self.res = V, f, res
@@ -107,16 +125,22 @@ class DeepShadow:
         a = np.clip(opacity * cover, 0.0, 0.999)
         tau = -np.log1p(-a).astype(np.float64)                         # optical depth
         self.dmax = (float(dist.max()) if len(dist) else 1.0) * 1.0001 + 1e-9
-        iu, iv, w = _bilinear(u, v, res)
+        if footprint is not None:
+            self.footprint = footprint
+        iu, iv, w = _footprint(u, v, res, self.footprint)
         self.iu, self.iv, self.w = iu, iv, w
-        pix = iv * res + iu                                            # [N, 4]
+        self.k = w.shape[1]
+        pix = iv * res + iu                                            # [N, k]
         key = (pix.astype(np.float64) + (dist / self.dmax)[:, None]).ravel()
         order = np.argsort(key)
         self.key = key[order]
-        self.cum = np.concatenate([[0.0], np.cumsum((tau[:, None] * w).ravel()[order])])
+        tw = (tau[:, None] * w).ravel()[order]
+        self.cum = np.concatenate([[0.0], np.cumsum(tw)])
+        # for the soft depth test: running sum of optical depth x its position
+        self.cumk = np.concatenate([[0.0], np.cumsum(tw * (self.key - np.floor(self.key)))])
         self.rank = np.empty(len(order), np.int64)                     # entry -> sorted place
         self.rank[order] = np.arange(len(order))
-        self.rank = self.rank.reshape(-1, 4)
+        self.rank = self.rank.reshape(-1, self.k)
         # where each pixel's entries start in the sorted order
         self.start = np.searchsorted(self.key, np.arange(res * res + 1, dtype=np.float64), side="left")
         self.pix = pix
@@ -144,11 +168,26 @@ class DeepShadow:
 
     density = 1.0              # optical depth multiplier for shadows (thin shells block more)
 
+    def _front(self, s, lo, hi, x_lo, x_hi):
+        """Optical depth in front of a soft depth window [x_lo, x_hi] (key units, within the
+        column starting at sorted index s; lo, hi = sorted indices of the window's ends).
+
+        An occluder fully in front counts fully, one inside the window in proportion to
+        how far into it the receiver is -- the box-filtered depth test. A hard test made a
+        hair's whole shadow switch on or off as its depth crossed the receiver's, which
+        showed as jittering fur when the light moved."""
+        def G(stop, x):                     # integral of the in-front optical depth up to x
+            C = self.cum[stop] - self.cum[s]
+            K = self.cumk[stop] - self.cumk[s]
+            return x * C - K
+        width = np.maximum(x_hi - x_lo, 1e-12)
+        return (G(hi, x_hi) - G(lo, x_lo)) / width
+
     def _coverage_log_T(self, u, v, softness):
         """The renderer's coverage seen from the light (log transmittance), box-blurred for
         soft edges and read bilinearly at u, v."""
         logT = _blurred_log_T(self.gpu_T, softness)
-        iu, iv, w = _bilinear(u, v, self.res)
+        iu, iv, w = _footprint(u, v, self.res, self.footprint)
         return np.einsum('nk,nk->n', logT[iv, iu], w)
 
     def _combine(self, front, whole, w, u, v, softness, empty_frac=None):
@@ -170,20 +209,23 @@ class DeepShadow:
         r = self.rank                                                  # [N, 4]
         s = self.start[self.pix]
         e = self.start[self.pix + 1]
+        frac_key = self.key - np.floor(self.key)
         if np.any(np.asarray(bias) > 0):
-            # searched in sorted order, the queries are nearly ascending, which numpy's
-            # binary search exploits (several times faster than in splat order)
+            # soft depth window [own depth - 2 bias, own depth): searched in sorted order,
+            # the queries are nearly ascending, which numpy's binary search exploits
             n = len(self.key)
             inv = np.empty(n, np.int64)
-            inv[r.ravel()] = np.arange(n) // 4                          # sorted place -> splat
+            inv[r.ravel()] = np.arange(n) // self.k                     # sorted place -> splat
             b = np.asarray(bias, np.float64)
             b_sorted = b[inv] if b.ndim else np.full(n, float(b))
-            q = np.maximum(self.key - b_sorted / self.dmax, np.floor(self.key))
-            stop_sorted = np.minimum(np.searchsorted(self.key, q, side="left"), np.arange(n))
-            stop = stop_sorted[r]
+            q = np.maximum(self.key - 2 * b_sorted / self.dmax, np.floor(self.key))
+            lo_sorted = np.minimum(np.searchsorted(self.key, q, side="left"), np.arange(n))
+            lo = lo_sorted[r]
+            x_lo = (q - np.floor(q))[r]
+            x_hi = frac_key[r]
+            front = self._front(s, lo, r, x_lo, x_hi)
         else:
-            stop = r
-        front = self.cum[stop] - self.cum[s]
+            front = self.cum[r] - self.cum[s]
         whole = self.cum[e] - self.cum[s]
         return self._combine(front, whole, self.w, self.u, self.v, softness)
 
@@ -200,14 +242,19 @@ class DeepShadow:
         if not np.any(seen):
             return out
         u, v, dist = u[seen], v[seen], dist[seen]
-        iu, iv, w = _bilinear(u, v, res)
+        iu, iv, w = _footprint(u, v, res, self.footprint)
         pix = iv * res + iu
-        d = np.minimum(np.maximum(dist - np.asarray(bias)[seen] if np.ndim(bias) else dist - bias,
-                                  0.0) / self.dmax, 0.9999)
+        b = np.asarray(bias)[seen] if np.ndim(bias) else bias
+        # soft depth window [dist - 2 bias, dist) (the hard test was at dist - bias)
+        d_hi = np.minimum(np.maximum(dist, 0.0) / self.dmax, 0.9999)
+        d_lo = np.minimum(np.maximum(dist - 2 * b, 0.0) / self.dmax, d_hi)
         s = self.start[pix]
         e = self.start[pix + 1]
-        stop = np.searchsorted(self.key, (pix + d[:, None]).ravel(), side="left").reshape(pix.shape)
-        front = self.cum[stop] - self.cum[s]
+        lo = np.searchsorted(self.key, (pix + d_lo[:, None]).ravel(), side="left").reshape(pix.shape)
+        hi = np.searchsorted(self.key, (pix + d_hi[:, None]).ravel(), side="left").reshape(pix.shape)
+        x_lo = np.broadcast_to(d_lo[:, None], pix.shape)
+        x_hi = np.broadcast_to(d_hi[:, None], pix.shape)
+        front = self._front(s, lo, hi, x_lo, x_hi)
         whole = self.cum[e] - self.cum[s]
         empty_frac = None
         if surface and self.gpu_depth is not None:
@@ -249,7 +296,16 @@ def surface_visibility(sm, pts, bias, softness):
 
 
 def light_visibility(eye, target, corners, means, opacity, size, query, bias, res, softness,
-                     density=1.0, tris=None, extra=None, extra_bias=0.0):
+                     density=1.0, tris=None, extra=None, extra_bias=0.0, footprint=1.0):
+    """See _light_visibility; cross-faded between shadow-map layouts (_view_modes)."""
+    return _blend_modes(lambda mode: _light_visibility(
+        eye, target, corners, means, opacity, size, query, bias, res, softness, density, tris,
+        extra, extra_bias, mode, footprint), eye, target, corners)
+
+
+def _light_visibility(eye, target, corners, means, opacity, size, query, bias, res, softness,
+                      density=1.0, tris=None, extra=None, extra_bias=0.0, mode="single",
+                      footprint=1.0):
     """Light reaching each `query` splat from a light at `eye` (deep opacity shadows).
 
     One map aimed at the model when it fits in a reasonable field of view; otherwise
@@ -267,7 +323,7 @@ def light_visibility(eye, target, corners, means, opacity, size, query, bias, re
         ax = np.argmax(np.abs(rel), axis=1)
         return ax * 2 + (np.take_along_axis(rel, ax[:, None], 1)[:, 0] < 0)
 
-    for V, f_unit, fi in _face_views(eye, target, corners):
+    for V, f_unit, fi in _face_views(eye, target, corners, mode):
         f = f_unit * res
         if fi is None:
             inside = slice(None)
@@ -286,7 +342,7 @@ def light_visibility(eye, target, corners, means, opacity, size, query, bias, re
             xq = None if extra is None else np.nonzero(face_x == fi)[0]
             if len(q) == 0 and (xq is None or len(xq) == 0):
                 continue
-        sm = DeepShadow(V, f, res, means[inside], opacity[inside], size[inside])
+        sm = DeepShadow(V, f, res, means[inside], opacity[inside], size[inside], footprint)
         sm.density = density
         if query is means:
             if fi is None:
@@ -309,16 +365,51 @@ def light_visibility(eye, target, corners, means, opacity, size, query, bias, re
     return vis if extra is None else (vis, vis_x)
 
 
-def _face_views(eye, target, corners):
-    """The light's view(s): one aimed at the model, or a cube of six around a close light.
-    Yields (V, f_per_unit_res, face_index or None)."""
+SINGLE_UNTIL, CUBE_FROM = 1.4, 1.8      # map half-width (tan) where single fades into cube
+
+
+def _view_modes(eye, target, corners):
+    """How to shadow from a light at `eye`: [(mode, weight)]. One map aimed at the model
+    while it fits a moderate field of view, a cube of six maps around a light close to or
+    inside it, and in between both, cross-faded: the two disagree slightly (a cube face
+    spreads its pixels wider), and a hard switch showed as a jump in brightness."""
     V = look_at(eye, target)
     pc = corners @ V[:3, :3].T + V[:3, 3]
-    if np.all(pc[:, 2] > 1e-9):
-        t = float(np.max(np.abs(pc[:, :2]) / pc[:, 2:3]))
-        if t < 1.6:
-            yield V, 0.5 / (t * 1.05), None
-            return
+    if not np.all(pc[:, 2] > 1e-9):
+        return [("cube", 1.0)]
+    t = float(np.max(np.abs(pc[:, :2]) / pc[:, 2:3]))
+    if t <= SINGLE_UNTIL:
+        return [("single", 1.0)]
+    if t >= CUBE_FROM:
+        return [("cube", 1.0)]
+    x = (t - SINGLE_UNTIL) / (CUBE_FROM - SINGLE_UNTIL)
+    w = x * x * (3 - 2 * x)
+    return [("single", 1.0 - w), ("cube", w)]
+
+
+def _blend_modes(fn, eye, target, corners):
+    """Run fn(mode) for each mode the light needs and cross-fade the results (arrays, or
+    tuples of arrays)."""
+    out = None
+    for mode, w in _view_modes(eye, target, corners):
+        r = fn(mode)
+        if out is None:
+            out = tuple(x * np.float32(w) for x in r) if isinstance(r, tuple) else r * np.float32(w)
+        else:
+            out = tuple(a + b * np.float32(w) for a, b in zip(out, r)) if isinstance(r, tuple) \
+                else out + r * np.float32(w)
+    return out
+
+
+def _face_views(eye, target, corners, mode="single"):
+    """The light's view(s) for `mode`: one map aimed at the model ("single"), or a cube of
+    six around the light ("cube"). Yields (V, f_per_unit_res, face_index or None)."""
+    if mode == "single":
+        V = look_at(eye, target)
+        pc = corners @ V[:3, :3].T + V[:3, 3]
+        t = float(np.max(np.abs(pc[:, :2]) / np.maximum(pc[:, 2:3], 1e-9)))
+        yield V, 0.5 / (t * 1.05), None
+        return
     ups = [(0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 1, 0), (0, 1, 0)]
     for axis in range(3):
         for sign_i, sign in enumerate((1.0, -1.0)):
@@ -328,6 +419,14 @@ def _face_views(eye, target, corners):
 
 def quick_light_visibility(eye, target, corners, means, width, res, density=1.0, tris=None,
                            bias=0.0, extra=None):
+    """See _quick_light_visibility; cross-faded between shadow-map layouts (_view_modes)."""
+    return _blend_modes(lambda mode: _quick_light_visibility(
+        eye, target, corners, means, width, res, density, tris, bias, extra, mode),
+        eye, target, corners)
+
+
+def _quick_light_visibility(eye, target, corners, means, width, res, density=1.0, tris=None,
+                            bias=0.0, extra=None, mode="single"):
     """Cheap level-of-detail shadows for lights being moved: one render per view from the
     light gives coverage and the depth where coverage reaches 50%. A splat well behind that
     surface gets the column's coverage, one in front gets full light, blended across the fur
@@ -362,7 +461,7 @@ def quick_light_visibility(eye, target, corners, means, width, res, density=1.0,
             out = np.where((pc[:, 2] > 1e-9) & (u >= 0) & (u < res) & (v >= 0) & (v < res), out, 1.0)
         return out
 
-    for V, f_unit, fi in _face_views(eye, target, corners):
+    for V, f_unit, fi in _face_views(eye, target, corners, mode):
         f = f_unit * res
         if fi is not None:
             if face is None:
@@ -461,6 +560,12 @@ class Relighter:
     mesh_points = None         # mesh surface points to find the splats' shadow at
     mesh_vis = None            # -> light name: light reaching each mesh point (after colours())
 
+    def shadow_bias(self):
+        """How far in front of a splat an occluder must be to shade it (the soft depth
+        test's window is twice this): the splat's own size, but at least a hair's
+        thickness, or tiny splats flip between lit and shadowed as near-equal depths swap."""
+        return np.maximum(2.0 * self.splat_size, np.float32(0.002 * self.extent))
+
     def _tris_for(self, L):
         """Mesh triangles that can block light L. Light bounced off a mirror comes from the
         light's image behind it: only what's in front of the mirror (the room side) counts,
@@ -480,10 +585,10 @@ class Relighter:
                 self.mesh_vis[name] = np.ones(len(self.mesh_points), np.float32)
             return 1.0
         out = light_visibility(eye, self.centre, self.corners, self.means, self.opacity,
-                               self.occluder_size, self.means, 2.0 * self.splat_size,
+                               self.occluder_size, self.means, self.shadow_bias(),
                                shadow_res, softness, self.shadow_density,
                                self._tris_for(L) if L is not None else self.mesh_tris,
-                               self.mesh_points, 0.004 * self.extent)
+                               self.mesh_points, 0.004 * self.extent, self.shadow_footprint)
         if self.mesh_points is None:
             return out
         self.mesh_vis[name] = out[1]
@@ -501,7 +606,7 @@ class Relighter:
                 v = quick_light_visibility(eye, self.centre, self.corners, self.means,
                                            self.quick_width * self.extent, shadow_res,
                                            self.shadow_density, self._tris_for(L),
-                                           2.0 * self.splat_size, self.mesh_points)
+                                           self.shadow_bias(), self.mesh_points)
                 if self.mesh_points is not None:
                     v, self.mesh_vis[L["name"]] = v
                 e = e * v
@@ -512,6 +617,7 @@ class Relighter:
 
     shine_colour = 0.25        # 0: neutral (brightness only) ... 1: the full captured colour
     shadow_density = 4.0       # see SpirulaSettings.shadow_density
+    shadow_footprint = 1.5     # shadow-map pixels each splat is spread over (DeepShadow)
     quick_width = 0.08         # light falloff depth behind the lit surface (quick shadows), x extent
 
     def shine_at(self, h):

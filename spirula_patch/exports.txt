@@ -5,3 +5,8 @@ _sr_render_ex
 _sr_set_colors
 _sr_shutdown
 _sr_set_render_degree
+_sr_shared_frames
+_sr_render_to_frame
+_sr_set_lens
+_sr_add_shared_frames
+_sr_color_buffer
