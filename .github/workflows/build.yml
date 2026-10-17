@@ -105,7 +105,15 @@ jobs:
 
       - name: Smoke test (renders on Mesa's software Vulkan)
         if: runner.os == 'Linux'
-        run: python tools/smoke_test.py libout
+        run: |
+          python -X faulthandler tools/smoke_test.py libout || {
+            echo "== failed; again with the engine's automatic bin tiles"
+            SR_BIN_TILE=0 python -X faulthandler tools/smoke_test.py libout && echo "== passes with SR_BIN_TILE=0"
+            echo "== backtrace"
+            sudo apt-get install -y gdb > /dev/null
+            gdb -batch -ex run -ex bt --args python tools/smoke_test.py libout 2>&1 | tail -40
+            exit 1
+          }
 
       - name: Load test
         if: runner.os != 'Linux'
