@@ -31,7 +31,7 @@ def main():
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr("blender_manifest.toml", manifest)
         for name in sorted(os.listdir(PKG)):
-            if name.endswith(".py"):
+            if name.endswith((".py", ".json")):
                 z.write(os.path.join(PKG, name), name)
         z.write(a.lib, "lib/" + LIB_NAMES[a.platform])
     print(path)

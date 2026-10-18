@@ -67,6 +67,46 @@ built on GitHub Actions from upstream Spirula Studio plus the patch in `spirula_
 
 Reports from Windows and Linux users are very welcome.
 
+## Lenses and film from Vintage Click
+
+![Two bee scans through a swirly Soviet 58 mm wide open, on a tungsten cinema stock](docs/lens_solnce_backlot800t.jpg)
+
+![The same scene on a reportage black-and-white stock](docs/film_tripan400.jpg)
+
+The camera bag and film fridge of [Vintage Click](https://github.com/timfennell/vintage-click), the
+vintage 35 mm camera game built on the same renderer, are in the Spirula panel: 37 classic
+manual-focus lenses in six shelves (field primes, screw-mount classics, bokeh monsters, macro,
+exotics, toys and mods) and 17 film stocks, all made-up names "inspired by" real ones.
+
+**Lens:** sets the scene camera's focal length (36 mm film), f-stop range and blades, and turns on
+depth of field. Final renders then expose through it the way the game's shutter does: the
+splats are rendered from sub-pupils of the lens, each through the renderer's own lens projection,
+so the lens's character comes from the same code as in the game:
+
+- the bokeh's shape: blades, a round or oval stop, a mirror lens's ring, rim-bright soap bubbles
+  or rim-dark smooth discs;
+- cat's eyes toward the corners (the barrel clipping off-axis pupils), and swirl where the field
+  curves (Petzval, Helios-type, reversed elements);
+- spherical-aberration glow wide open, axial colour fringes in the bokeh (64+ samples), lateral
+  colour and light fall-off toward the corners, a mod's horizontal streak flares;
+- tilt (the Bendy: Tilt in the panel) and shift (PC lenses: the camera's own Shift X / Y).
+
+Meshes follow every sub-pupil too, including the tilted or curved focus and the barrel's
+clipping. Looking through the scene camera, the viewport shows the lens's depth of field as the
+game's finder does (one render of the whole pupil).
+
+**Film:** develops final renders on the stock: its characteristic curve (toe, shoulder, black
+level), dye crosstalk and balance (tungsten stocks go blue in neutral light), saturation,
+black-and-white or colour-infrared response, grain by speed, halation on stocks without an
+anti-halation layer, and push / pull development. The viewport shows the stock's colour and curve
+(grain and halation are final only). Use the Standard view transform: the film is the tone
+mapping.
+
+Lens blur depends on the scene's real size (see Depth of field below): a scan is usually a small
+object, so set Scene > Units > Unit Scale to its real size per unit. The data comes from the
+game's source (`tools/import_optics.py` regenerates `spirula_render/optics.json`). Fisheyes are
+the game's only lenses not here: the engine renders perspective views.
+
 ## Depth of field
 
 Turn on the camera's Depth of Field (Camera properties) as for any Blender render: focus distance

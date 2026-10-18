@@ -6,6 +6,66 @@ from . import meshes
 from .engine import SpirulaRenderEngine
 
 
+def _slug(name):
+    import re
+    return re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_").upper()
+
+
+_LENS_ITEMS = []
+_FILM_ITEMS = []
+
+
+def lens_items(self, context):
+    """The game's camera bag, shelf by shelf (Blender's own camera first)."""
+    if not _LENS_ITEMS:
+        from . import optics
+        _LENS_ITEMS.append(("NONE", "Blender Camera", "Blender's camera as set: depth of field from its "
+                            "f-stop and blades, no lens character, no film"))
+        shelf = None
+        for l in optics.lenses():
+            if l["collection"] != shelf:
+                shelf = l["collection"]
+                _LENS_ITEMS.append(("", shelf, ""))
+            _LENS_ITEMS.append((_slug(l["name"]), l["name"], l["inspiredBy"]))
+    return _LENS_ITEMS
+
+
+def film_items(self, context):
+    if not _FILM_ITEMS:
+        from . import optics
+        _FILM_ITEMS.append(("NONE", "No Film", "The render as it is (digital)"))
+        for f in optics.films():
+            _FILM_ITEMS.append((_slug(f["name"]), f["name"], f"ISO {f['iso']:.0f}: {f['inspiredBy']}"))
+    return _FILM_ITEMS
+
+
+def chosen_lens(settings):
+    from . import optics
+    return next((l for l in optics.lenses() if _slug(l["name"]) == settings.lens), None)
+
+
+def chosen_film(settings):
+    from . import optics
+    return next((f for f in optics.films() if _slug(f["name"]) == settings.film), None)
+
+
+def _lens_changed(self, context):
+    """Mount the lens on the scene camera: its focal length (36 mm film), its f-stop range,
+    its blades; depth of field on."""
+    lens = chosen_lens(self)
+    cam = context.scene.camera if context and context.scene else None
+    if lens is None or cam is None or cam.type != 'CAMERA':
+        return
+    c = cam.data
+    c.lens = lens["focalMM"]
+    c.sensor_fit = 'HORIZONTAL'
+    c.sensor_width = 36.0
+    c.dof.use_dof = True
+    c.dof.aperture_fstop = min(max(c.dof.aperture_fstop, lens["maxAperture"]), lens["minAperture"])
+    c.dof.aperture_blades = int(lens["blades"])
+    c.dof.aperture_rotation = lens["bladeRotation"]
+
+
 class SpirulaSettings(bpy.types.PropertyGroup):
     primitive: bpy.props.EnumProperty(
         name="Splat Model", default='3dgs',
@@ -54,6 +114,24 @@ class SpirulaSettings(bpy.types.PropertyGroup):
         description="Final renders with the camera's Depth of Field on: the splats are rendered "
                     "from this many points across the lens and averaged (exact blur, fur included). "
                     "Each sample is one more splat render; relighting is done once")
+    lens: bpy.props.EnumProperty(
+        name="Lens", items=lens_items, update=_lens_changed,
+        description="A classic 35 mm manual-focus lens from Vintage Click's bag: sets the camera's "
+                    "focal length and f-stop range, and gives final renders its character "
+                    "(bokeh shape, cat's eyes, swirl, glow, colour fringes, fall-off)")
+    lens_tilt: bpy.props.FloatVectorProperty(
+        name="Tilt", size=2, default=(0.0, 0.0), soft_min=-15, soft_max=15, subtype='XYZ',
+        description="Tilt lens only: tilt of the focus plane, degrees (x across the frame, y up and down)")
+    film: bpy.props.EnumProperty(
+        name="Film", items=film_items,
+        description="Develop final renders on a film stock from Vintage Click: its curve, colour, grain, halation")
+    film_push: bpy.props.IntProperty(
+        name="Push / Pull", default=0, min=-1, max=3,
+        description="Rate the film this many stops faster (+, pushed: more contrast and grain) or slower (-)")
+    film_exposure: bpy.props.FloatProperty(
+        name="Film Exposure", default=0.0, soft_min=-4, soft_max=4,
+        description="Exposure onto the film, stops over the render's own (mid grey 0.18 lands on the curve's middle)")
+    film_grain: bpy.props.BoolProperty(name="Grain", default=True, description="The stock's grain")
     use_meshes: bpy.props.BoolProperty(
         name="Meshes", default=True,
         description="Render polygon objects too (path traced by Blender's Cycles inside this engine), "
@@ -96,6 +174,25 @@ class SPIRULA_PT_render(bpy.types.Panel):
             box.prop(vs, "view_transform")
         layout.prop(context.scene.render, "film_transparent")
         layout.prop(s, "viewport_resolution")
+        box = layout.box()
+        box.label(text="Lens and Film (Vintage Click)", icon='OUTLINER_OB_CAMERA')
+        box.prop(s, "lens")
+        lens = chosen_lens(s)
+        if lens is not None:
+            from . import optics
+            col = box.column(align=True)
+            col.label(text=lens["inspiredBy"])
+            col.label(text="f/%g - f/%g, focuses to %g m" % (lens["maxAperture"], lens["minAperture"], lens["minFocusM"]))
+            mv = lens.get("movement") or {}
+            if mv.get("kind") == "tilt":
+                box.prop(s, "lens_tilt")
+            elif mv.get("kind") == "shift":
+                box.label(text="Shift: use the camera's Shift X / Y (up to %g mm = %.2f)" % (mv["most"], mv["most"] / 36))
+        box.prop(s, "film")
+        if chosen_film(s) is not None:
+            box.prop(s, "film_push")
+            box.prop(s, "film_exposure")
+            box.prop(s, "film_grain")
         row = layout.row()
         cam = context.scene.camera
         row.active = cam is not None and cam.type == 'CAMERA' and cam.data.dof.use_dof

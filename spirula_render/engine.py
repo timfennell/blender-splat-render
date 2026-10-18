@@ -10,7 +10,7 @@ import gpu
 import numpy as np
 from gpu_extras.presets import draw_texture_2d
 
-from . import meshes, native, relight, scene_data as sd, transform, viewport_meshes
+from . import meshes, native, optics, relight, scene_data as sd, transform, viewport_meshes
 
 # One renderer (one GPU context and one uploaded splat set) serves the viewport and
 # final renders, which can run at the same time on different threads.
@@ -21,6 +21,7 @@ _CACHE = {"key": None, "colour_key": None}
 _MESH = {"tris": None, "points": None, "serial": 0, "mirrors": None}
 _SERIAL = itertools.count(1)
 _LAST_FRAME = {}        # the last finished final render, shown while the next frame renders
+_LENS_TABLES = {}       # (lens, f-number) -> pupil moments (optics.pupil_table)
 
 
 def _splat_key(obj):
@@ -198,7 +199,7 @@ def _splat_objects(depsgraph):
 
 
 def _render_view(depsgraph, settings, cam_world, V_of_world, fx, fy, cx, cy, W, H, report,
-                 follow_camera=True, quick=False, viewport=False, mesh=None):
+                 follow_camera=True, quick=False, viewport=False, mesh=None, lens_params=None):
     """Render the scene's splat object. Returns linear premultiplied rgb, alpha, ray depth.
 
     mesh: optional (triangles, surface points, key): meshes that shadow the splats, and mesh
@@ -219,7 +220,13 @@ def _render_view(depsgraph, settings, cam_world, V_of_world, fx, fy, cx, cy, W, 
             _MESH.update(tris=None, points=None, mirrors=None)
             if _CACHE.get("relighter") is not None:
                 _CACHE["relighter"].mesh_tris = _CACHE["relighter"].mesh_points = None
-        rgb, alpha, d = native.render(V_of_world(), fx, fy, cx, cy, W, H, settings.primitive)
+        if lens_params is not None:
+            native.set_lens(lens_params)
+        try:
+            rgb, alpha, d = native.render(V_of_world(), fx, fy, cx, cy, W, H, settings.primitive)
+        finally:
+            if lens_params is not None:
+                native.set_lens(None)
     return _to_linear(rgb, alpha, settings), alpha, d
 
 
@@ -288,7 +295,8 @@ def _dof_params(scene, cam_obj, cam_world):
     if radius <= 0 or focus <= 0:
         return None
     return dict(radius=radius, focus=focus, blades=int(dof.aperture_blades),
-                rotation=float(dof.aperture_rotation), ratio=float(dof.aperture_ratio) or 1.0)
+                rotation=float(dof.aperture_rotation), ratio=float(dof.aperture_ratio) or 1.0,
+                fstop=fstop, focal_mm=float(cam.lens), mpu=scale)
 
 
 def lens_samples(n, blades=0, rotation=0.0, ratio=1.0):
@@ -329,12 +337,62 @@ def _dof_samples(dof, n, cam_world, fx, fy, cx, cy, W, H, settings, test_break=N
         yield _to_linear(rgb, alpha, settings), alpha, d, dx, dy
 
 
+def _lens_cells(lens, n, dof, count, cam_world, fx, fy, cx, cy, W, H, settings, tilt,
+                test_break=None, stats=None):
+    """An exposure through a lens from the camera game's bag: `count` sub-pupils (cells),
+    each rendered with the view sheared to its lens point and the renderer's projection
+    blurring each splat by the cell's own share of the pupil -- cut by the barrel where it is
+    on the frame (cat's eyes), focus tilted or curved over the field (swirl), the rim
+    focusing nearer (spherical aberration), an oval stop, and with axial colour every third
+    cell focused for one channel. Yields per cell (linear premultiplied rgb, alpha, ray depth,
+    dx, dy, 1/focus, the cell in aperture radii, channel or -1). (RenderLoop.step)"""
+    V = np.array(sd.view_matrix(cam_world, _IDENTITY), np.float64)
+    mpu = dof["mpu"]
+    focus_m = dof["focus"] * mpu
+    radius_units = lens["focalMM"] / 1000 / n / 2 / mpu
+    cells = optics.cell_centres(lens, count)
+    split = optics.splits_colour(lens, count)
+    opn = lens["maxAperture"] / n
+    field_r = float(np.hypot(W, H)) / 2
+    try:
+        for i, c in enumerate(cells):
+            if test_break is not None and test_break():
+                return
+            if stats is not None and i % 4 == 0:
+                stats(f"Spirula: exposing through the lens {i + 1}/{count}")
+            channel = i % 3 if split else -1
+            dioptres = 1 / focus_m
+            if channel >= 0:
+                dioptres += lens["axialCA"] * (1 - channel)
+            dioptres += lens["sphericalAberration"] * float(c @ c) * opn * opn
+            focus_k = 1 / dioptres
+            inv_focus = mpu / focus_k                       # per scene unit
+            d = np.array([c[0] * lens["squeeze"], c[1]]) * radius_units
+            share = math.sqrt((1 if channel < 0 else 3) / count)
+            params = optics.lens_params(lens, n, fx, count if channel < 0 else count // 3,
+                                        (cx, cy), field_r, mpu, focus_k, tilt, cell=d, patch=share)
+            T = np.eye(4)
+            T[0, 3], T[1, 3] = -d[0], -d[1]
+            Vs = (T @ V).astype(np.float32)
+            with _LOCK:
+                native.set_lens(params)
+                try:
+                    rgb, alpha, dep = native.render(Vs, fx, fy, cx + fx * d[0] * inv_focus,
+                                                    cy + fy * d[1] * inv_focus, W, H, settings.primitive)
+                finally:
+                    native.set_lens(None)
+            yield _to_linear(rgb, alpha, settings), alpha, dep, d[0], d[1], inv_focus, c, channel
+    finally:
+        with _LOCK:
+            native.set_lens(None)
+
+
 class _MeshWarp:
     """Cycles' pinhole mesh layer seen from another point on the lens: each pixel moves by
     its parallax relative to the focus plane (forward, nearest pixel, near over far), and
     one-pixel cracks from stretching are filled from their neighbours."""
 
-    def __init__(self, M, z, on_top, fx, fy, focus):
+    def __init__(self, M, z, on_top, fx, fy, focus, field_focus=None):
         H, W = z.shape
         self.M, self.on_top, self.shape = M, on_top, (H, W)
         self.fx, self.fy, self.focus = fx, fy, focus
@@ -342,12 +400,15 @@ class _MeshWarp:
         order = np.argsort(-z[ys, xs], kind="stable")          # far first: near writes win
         self.ys, self.xs = ys[order], xs[order]
         self.z = z[self.ys, self.xs]
-        self.k = (1.0 / self.z - 1.0 / focus)
+        # extra 1/focus over the field (a tilted or curved focus surface), per mesh pixel
+        self.field = 0.0 if field_focus is None else field_focus[self.ys, self.xs]
+        self.k = (1.0 / self.z - 1.0 / focus - self.field)
 
-    def at(self, dx, dy):
+    def at(self, dx, dy, inv_focus=None):
         H, W = self.shape
-        tu = np.rint(self.xs - self.fx * dx * self.k).astype(np.int64)
-        tv = np.rint(self.ys - self.fy * dy * self.k).astype(np.int64)
+        k = self.k if inv_focus is None else 1.0 / self.z - inv_focus - self.field
+        tu = np.rint(self.xs - self.fx * dx * k).astype(np.int64)
+        tv = np.rint(self.ys - self.fy * dy * k).astype(np.int64)
         ok = (tu >= 0) & (tu < W) & (tv >= 0) & (tv < H)
         out = np.zeros((H, W, 4), np.float32)
         z = np.full((H, W), np.inf, np.float32)
@@ -516,6 +577,7 @@ class SpirulaRenderEngine(bpy.types.RenderEngine):
         cam_world = cam_obj.evaluated_get(depsgraph).matrix_world.copy()
         film_transparent = meshes.original_film_transparent(scene)
         world = tuple(scene.world.color)[:3] if scene.world else (0.05, 0.05, 0.05)
+        scene_frame = scene.frame_current
         frozen = _freeze(depsgraph)
         dof = _dof_params(scene, cam_obj, cam_world) if settings.dof_samples > 1 else None
         # Show the previous frame's finished image until this one is ready.
@@ -572,7 +634,15 @@ class SpirulaRenderEngine(bpy.types.RenderEngine):
         M = None
         if mesh is not None:
             M = self._mesh_colour(mesh, mesh_vis, settings)
-        if dof is not None and out is not None:
+        lens, film = optics.chosen(settings)
+        n_stop = None
+        if lens is not None:
+            fs = dof["fstop"] if dof is not None else lens["maxAperture"]
+            n_stop = min(max(fs, lens["maxAperture"]), lens["minAperture"])
+        if lens is not None and dof is not None and out is not None:
+            rgba, depth = self._expose_lens(lens, n_stop, dof, settings, mesh, M, rgba, depth, ray,
+                                            cam_world, fx, fy, cx, cy, W, H, film_transparent, world)
+        elif dof is not None and out is not None:
             # Thin lens: every lens sample sees the splats from its own point (rendered) and the
             # meshes too (Cycles' pinhole image moved to that point by its depth); the two
             # meet by depth per sample, then the samples are averaged.
@@ -604,7 +674,85 @@ class SpirulaRenderEngine(bpy.types.RenderEngine):
         elif mesh is not None:
             rgba = self._blend(rgba, depth, M, mesh["dist"], mesh.get("on_top"))
             depth = np.minimum(depth, mesh["dist"])
+        if lens is not None or film is not None:
+            t2 = time.time()
+            rgba = self._finish(rgba, settings, lens, n_stop, film, (cx, cy), world, film_transparent,
+                                scene_frame)
+            print(f"Spirula: lens and film finishing in {time.time() - t2:.2f}s")
         self._write(rgba, depth, ray, film_transparent, world, W, H, remember=True)
+
+    def _expose_lens(self, lens, n, dof, settings, mesh, M, rgba, depth, ray, cam_world,
+                     fx, fy, cx, cy, W, H, film_transparent, world):
+        """An exposure through a lens from the camera game's bag (_lens_cells), meshes moved to
+        each cell's lens point (focus tilted / curved over the field as the splats' is) and cut
+        by the barrel where the cell is clipped; cells weighted by the pupil's rim weighting,
+        a channel each with axial colour, and normalised by the light through the frame's
+        centre -- so the corners darken where the barrel clips, as on the lens."""
+        t1 = time.time()
+        tilt = tuple(settings.lens_tilt) if (lens.get("movement") or {}).get("kind") == "tilt" else (0.0, 0.0)
+        py, px = np.mgrid[0:H, 0:W].astype(np.float32) + 0.5
+        half = float(np.hypot(W, H)) / 2
+        qx, qy = (px - cx) / half, (py - cy) / half
+        warp = None
+        if M is not None:
+            field = optics.field_focus(lens, dof["mpu"], tilt, qx, qy).astype(np.float32)
+            warp = _MeshWarp(M, mesh["dist"] / ray, mesh.get("on_top"), fx, fy, dof["focus"], field)
+        q = np.stack([qx, qy], -1)
+        acc = np.zeros((H, W, 3), np.float64)
+        acc_a = np.zeros((H, W), np.float64)
+        full = np.zeros(3)
+        full_a = 0.0
+        done = 0
+        for rgb_k, a_k, d_k, dx, dy, inv_focus, c, channel in _lens_cells(
+                lens, n, dof, settings.dof_samples, cam_world, fx, fy, cx, cy, W, H, settings, tilt,
+                self.test_break, lambda m: self.update_stats("", m)):
+            S = np.concatenate([rgb_k, a_k[..., None]], -1)
+            if warp is not None:
+                Mk, zk, top_k = warp.at(dx, dy, inv_focus)
+                # the barrel clips this cell for meshes where the splats were clipped in the render
+                keep = optics.pupil_weight(c[None, None, :], q, lens, n) > 0
+                Mk = Mk * keep[..., None]
+                dS = np.where(a_k > 1e-3, d_k, np.inf)
+                S = self._blend(S, dS, Mk, zk * ray, top_k)
+            w = float(optics.rim_weight(c, lens))
+            mask = np.ones(3) if channel < 0 else np.eye(3)[channel]
+            acc += S[..., :3] * (w * mask)
+            acc_a += S[..., 3] * w
+            centre = float(optics.pupil_weight(c, np.zeros(2), lens, n))
+            full += centre * mask
+            full_a += centre
+            done += 1
+            if done % 8 == 0 and done < settings.dof_samples and full.min() > 0:
+                part = np.concatenate([acc / full, (acc_a / max(full_a, 1e-9))[..., None]], -1)
+                self._write(part.astype(np.float32), depth, ray, film_transparent, world, W, H)
+        if done and full.min() > 0:
+            rgba = np.concatenate([acc / full, np.clip(acc_a / max(full_a, 1e-9), 0, 1)[..., None]],
+                                  -1).astype(np.float32)
+            if mesh is not None:
+                depth = np.minimum(depth, mesh["dist"])
+        print(f"Spirula: {done} cells through the {lens['name']} at f/{n:g} in {time.time() - t1:.2f}s")
+        return rgba, depth
+
+    def _finish(self, rgba, settings, lens, n, film, axis, world, film_transparent, frame):
+        """Lens fall-off, lateral colour and streaks, then the film (curve, colour, grain,
+        halation), on the frame with its background. Returns premultiplied rgba."""
+        rgba = rgba.copy()
+        a = rgba[..., 3:4]
+        if not film_transparent:
+            rgba[..., :3] += np.array(world, np.float32) * (1 - a)
+            rgba[..., 3] = 1.0
+            lin = rgba[..., :3]
+        else:
+            lin = np.where(a > 1e-6, rgba[..., :3] / np.maximum(a, 1e-6), 0.0)
+        if lens is not None:
+            lin = optics.lens_finish(lin, lens, n, axis)
+            if lens["streak"] > 0:
+                lin = lin + optics.streak(lin, lens["streak"])
+        if film is not None:
+            lin = optics.develop(lin, film, settings.film_push, settings.film_exposure,
+                                 seed=int(frame) * 7919 + 13, grain=settings.film_grain)
+        rgba[..., :3] = lin if not film_transparent else lin * rgba[..., 3:4]
+        return rgba.astype(np.float32)
 
     def _quick_look(self, *args):
         try:
@@ -773,6 +921,26 @@ class SpirulaRenderEngine(bpy.types.RenderEngine):
         self._view["dirty"] = True
         self._view["mesh_dirty"] = True
 
+    def _viewport_lens(self, scene, rv3d, settings, fx, cx, cy, W, H):
+        """Looking through the scene camera with a lens from the bag and depth of field on:
+        the renderer's whole-pupil preview of that lens (one render: its off-axis pupil
+        shapes, tilt and curvature; the shutter's sub-pupils are final-render only)."""
+        lens, _ = optics.chosen(settings)
+        cam = scene.camera
+        if lens is None or rv3d.view_perspective != 'CAMERA' or cam is None or cam.type != 'CAMERA':
+            return None
+        dof = _dof_params(scene, cam, cam.matrix_world)
+        if dof is None:
+            return None
+        n = min(max(dof["fstop"], lens["maxAperture"]), lens["minAperture"])
+        key = (lens["name"], round(n, 4))
+        table = _LENS_TABLES.get(key)
+        if table is None:
+            table = _LENS_TABLES[key] = optics.pupil_table(lens, n)
+        tilt = tuple(settings.lens_tilt) if (lens.get("movement") or {}).get("kind") == "tilt" else (0.0, 0.0)
+        return optics.lens_params(lens, n, fx, 1, (cx, cy), float(np.hypot(W, H)) / 2, dof["mpu"],
+                                  dof["focus"] * dof["mpu"], tilt, table=table)
+
     def _viewport_mesh_layer(self, depsgraph):
         v = self._view
         layer = v.get("mesh_layer")
@@ -846,9 +1014,10 @@ class SpirulaRenderEngine(bpy.types.RenderEngine):
                 mirrors = meshes.mirror_planes(depsgraph) if settings.use_mirror_light else None
                 mesh = (tris, points, ("viewport", mesh_key, view_key[0], next(_SERIAL)), mirrors)
             try:
+                lens_params = self._viewport_lens(scene, rv3d, settings, fx, cx, cy, W, H)
                 out = _render_view(depsgraph, settings, cam_world, lambda: V, fx, fy, cx, cy,
                                    W, H, lambda m: None, follow_camera=not quick, quick=quick,
-                                   viewport=True, mesh=mesh)
+                                   viewport=True, mesh=mesh, lens_params=lens_params)
             except native.RenderError as e:
                 out = None
                 print("Spirula viewport:", e)
@@ -898,6 +1067,16 @@ class SpirulaRenderEngine(bpy.types.RenderEngine):
             extent = _CACHE["relighter"].extent if _CACHE.get("relighter") is not None else 1.0
             tex = layer.composite(v["texture"], v["ztex"], tuple(world)[:3], 0.002 * extent,
                                   region.width, region.height)
+        lens, film = optics.chosen(settings)
+        through_camera = rv3d.view_perspective == 'CAMERA'
+        if film is not None or (lens is not None and through_camera):
+            n = lens["maxAperture"] if lens is not None else None
+            cam = scene.camera
+            if lens is not None and cam is not None and cam.type == 'CAMERA':
+                n = min(max(cam.data.dof.aperture_fstop, lens["maxAperture"]), lens["minAperture"])
+            tex = viewport_meshes.film_pass(tex, tex.width, tex.height, (tex.width / 2, tex.height / 2),
+                                            lens if through_camera else None, n, film,
+                                            settings.film_push, settings.film_exposure)
         gpu.state.blend_set('ALPHA_PREMULT')
         self.bind_display_space_shader(scene)
         draw_texture_2d(tex, (0, 0), region.width, region.height)

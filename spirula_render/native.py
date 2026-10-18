@@ -52,6 +52,8 @@ def lib():
         L.sr_render_ex.restype = ctypes.c_int
         L.sr_set_colors.argtypes = [_FP, _FP]
         L.sr_set_colors.restype = ctypes.c_int
+        L.sr_set_lens.argtypes = [_FP, ctypes.c_int]
+        L.sr_set_lens.restype = ctypes.c_int
         L.sr_set_render_degree.argtypes = [ctypes.c_int]
         L.sr_set_render_degree.restype = None
         _LIB = L
@@ -110,3 +112,14 @@ def render_ex(viewmat, fx, fy, cx, cy, width, height, primitive="3dgs"):
 def set_render_degree(degree):
     """Render with at most `degree` SH bands (0 = base colour only); -1 = all loaded bands."""
     lib().sr_set_render_degree(int(degree))
+
+
+def set_lens(params):
+    """A thin lens inside the projection for the renders that follow (float4 table, layout in
+    the spirula fork's docs/notes/lens-defocus.md; optics.lens_params builds it), or None for
+    a pinhole. Process-wide: put it back to None when done."""
+    if params is None:
+        _check(lib().sr_set_lens(None, 0), "clearing the lens")
+        return
+    a = np.ascontiguousarray(params, np.float32).reshape(-1, 4)
+    _check(lib().sr_set_lens(_p(a), len(a)), "setting the lens")

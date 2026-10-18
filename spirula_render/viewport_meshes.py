@@ -312,3 +312,89 @@ class MeshLayer:
             shader.uniform_sampler("mesh_z", self.zdist)
             quad.draw(shader)
         return out
+
+
+def _film_shader():
+    if "film" in _SHADERS:
+        return _SHADERS["film"]
+    iface = gpu.types.GPUStageInterfaceInfo("spirula_film_iface")
+    iface.smooth('VEC2', "v_uv")
+    info = gpu.types.GPUShaderCreateInfo()
+    info.push_constant('VEC4', "P", 9)
+    info.sampler(0, 'FLOAT_2D', "img")
+    info.vertex_in(0, 'VEC2', "pos")
+    info.vertex_out(iface)
+    info.fragment_out(0, 'VEC4', "out_colour")
+    info.vertex_source('''
+void main() {
+    v_uv = pos * 0.5 + 0.5;
+    gl_Position = vec4(pos, 0.0, 1.0);
+}''')
+    info.fragment_source('''
+float s2l(float c) { return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4); }
+void main() {
+    vec2 size = P[0].xy, axis = P[0].zw;
+    vec2 px = v_uv * size;
+    vec3 lin = texture(img, v_uv).rgb;
+    if (P[1].z > 0.5) {
+        /* the lens: lateral colour and fall-off (Vintage Click's develop) */
+        float k = P[1].y;
+        lin.r = texture(img, (axis + (px - axis) * (1.0 - k)) / size).r;
+        lin.b = texture(img, (axis + (px - axis) * (1.0 + k)) / size).b;
+        vec2 q = (px - axis) / length(size * 0.5);
+        lin *= max(1.0 - P[1].x * dot(q, q), 0.0);
+    }
+    if (P[8].x > 0.5) {
+        /* the stock's colour and curve (film_look without grain and halation) */
+        lin *= P[1].w;
+        vec3 c = vec3(dot(P[2].xyz, lin), dot(P[3].xyz, lin), dot(P[4].xyz, lin)) * P[5].xyz;
+        if (P[5].w > 0.5) c = vec3(dot(P[6].xyz, c));
+        float luma = dot(c, vec3(0.2126, 0.7152, 0.0722));
+        c = max(vec3(luma) + (c - vec3(luma)) * P[6].w, vec3(0.0));
+        vec3 x = log2(max(c, vec3(1e-6)) / 0.18);
+        float kk = P[7].x * 0.34;
+        vec3 xs = mix(x * P[7].w, x * P[7].z, step(vec3(0.0), x));
+        vec3 y = 0.5 + 0.5 * tanh(kk * xs);
+        y = P[7].y + (1.0 - P[7].y) * y;
+        y = clamp(y, 0.0, 1.0);
+        lin = vec3(s2l(y.r), s2l(y.g), s2l(y.b));
+    }
+    out_colour = vec4(lin, 1.0);
+}''')
+    _SHADERS["film"] = gpu.shader.create_from_info(info)
+    return _SHADERS["film"]
+
+
+def film_pass(tex, W, H, axis, lens=None, n=None, film=None, push=0, stops=0.0):
+    """The viewport's look through a lens and film from Vintage Click: fall-off and lateral
+    colour (in camera view), the stock's colour and curve. Grain, halation and streaks are
+    final-render only. Returns an RGBA16F texture of linear values."""
+    from . import optics
+    P = [[float(W), float(H), float(axis[0]), float(axis[1])], [0.0, 0.0, 0.0, 1.0]]
+    P += [[0.0] * 4 for _ in range(7)]
+    if lens is not None:
+        P[1][0] = lens["vignette"] * min(1.0, lens["maxAperture"] / n) ** 1.5
+        P[1][1] = lens["lateralCA"]
+        P[1][2] = 1.0
+    if film is not None:
+        s = optics.developed(film, push)
+        P[1][3] = 2.0 ** stops
+        for i in range(3):
+            P[2 + i] = [*map(float, s["crosstalk"][i]), 0.0]
+        P[5] = [*map(float, s["balance"]), 1.0 if s["blackAndWhite"] else 0.0]
+        P[6] = [*map(float, s["bwMix"]), float(s["saturation"])]
+        P[7] = [float(s["contrast"]), float(s["blackLift"]), float(s["shoulder"]), float(s["toe"])]
+        P[8][0] = 1.0
+    out = gpu.types.GPUTexture((W, H), format='RGBA16F')
+    fb = gpu.types.GPUFrameBuffer(color_slots=(out,))
+    shader = _film_shader()
+    quad = batch_for_shader(shader, 'TRI_FAN', {"pos": ((-1, -1), (1, -1), (1, 1), (-1, 1))})
+    flat = [x for row in P for x in row]
+    with fb.bind():
+        fb.viewport_set(0, 0, W, H)
+        gpu.state.blend_set('NONE')
+        shader.bind()
+        shader.uniform_vector_float(shader.uniform_from_name("P"), gpu.types.Buffer('FLOAT', len(flat), flat), 4, 9)
+        shader.uniform_sampler("img", tex)
+        quad.draw(shader)
+    return out
