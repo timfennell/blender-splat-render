@@ -138,10 +138,10 @@ index 00000000..1a27874a
 +so the run can be paused and resumed around the void editing.
 diff --git a/docs/notes/lens-defocus.md b/docs/notes/lens-defocus.md
 new file mode 100644
-index 00000000..bb8feeb1
+index 00000000..a8d46d4b
 --- /dev/null
 +++ b/docs/notes/lens-defocus.md
-@@ -0,0 +1,30 @@
+@@ -0,0 +1,51 @@
 +# Thin-lens depth of field inside the projection
 +
 +`sr_set_lens` turns the pinhole projection into a thin lens for viewer renders
@@ -166,12 +166,33 @@ index 00000000..bb8feeb1
 +| index | contents |
 +|---|---|
 +| 0 | (on, 1/focus distance, aperture radius, 1 = moments from the table / 0 = isotropic) |
-+| 1 | (isotropic variance in radius^2 units, -, -, max blur sigma in pixels) |
++| 1 | (isotropic variance in radius^2 units, 1 = field rows 34..36 present, -, max blur sigma in pixels) |
 +| 2..33 | pupil at field radius `|q| = i/31 * 1.25` (q = 1 at the frame corner): (mean along q, variance along q, variance across q, light), in aperture radii |
++| 34 | focus over the field, added to 1/focus: (tilt per unit q x, y, radial curvature, tangential curvature at q = 1) |
++| 35 | (the cell's lens point in camera x/y, scene units; oval stop: pupil width / height, 0 = round; spherical aberration: extra 1/focus at the aperture's rim) |
++| 36 | (optical axis in this render's pixels x, y; field radius q = 1 in pixels; -) |
++| 37 | cells only: (cat's eye offset at q = 1, current aperture in wide-open radii, the cell's patch radius in aperture radii (0 = no barrel clipping here), -) |
 +
 +Mechanical vignetting clips off-axis pupils into cat's eyes: the table's
 +anisotropic variance and mean shift are what make off-axis bokeh stretch
 +and swirl.
++
++Focus off the axis (row 34) makes the blur per splat `F S F^T` with
++`F = diag(f) (k_r P + k_t Q)`, `P` and `Q` projecting along and across the
++field direction, `k_r`, `k_t` the radial and tangential defocus there. A
++tilted plane (a tilt lens) and a curved field (a Petzval's swirl: tangential
++focus far from radial smears off-axis blur round the centre) both come out
++of it. With cells, each cell's view is already sheared for the axial focus,
++so only the extra `f (M - k) d` moves its splats. Row 36 lets tiles of a big
++photo, and a shifted lens, measure the field from the real optical axis.
++
++A cell stands for a patch of lens (radius `h`). Where the barrel cuts it
++(row 37), the boundary near the patch is taken as a chord at `t h` from its
++centre: the patch keeps `kept = pi - (acos t - t sqrt(1 - t^2))` of `pi h^2`
++of its light, its centre moves `2/3 h (1 - t^2)^1.5 / kept` away from the
++chord and its spread across the chord narrows. Clipping whole cells instead
++left beads along cat's-eye edges, one per cell (one colour each with axial
++colour).
 diff --git a/docs/notes/training-capture.md b/docs/notes/training-capture.md
 new file mode 100644
 index 00000000..4cc5312b
@@ -2671,19 +2692,35 @@ index c6a86710..1c010f69 100644
      // Capabilities::required_subgroup_size).
      VkPhysicalDeviceSubgroupSizeControlFeaturesEXT fsgc{
 diff --git a/src/backend/vulkan/kernels/ProjectionFwd.cpp b/src/backend/vulkan/kernels/ProjectionFwd.cpp
-index ae0d78b6..e03ed10d 100644
+index ae0d78b6..c2115e98 100644
 --- a/src/backend/vulkan/kernels/ProjectionFwd.cpp
 +++ b/src/backend/vulkan/kernels/ProjectionFwd.cpp
-@@ -9,6 +9,8 @@
+@@ -6,9 +6,24 @@
+ #include <kernels/projection/ProjectionFwd.cuh>
+ 
+ #include "backend/vulkan/kernels/KernelCommon.h"
++#include "backend/api/BackendRuntime.h"
  
  namespace {
  
 +uint64_t g_lens_defocus = 0;   // backend/vulkan/LensDefocus.h
 +
++// Never hand the shader a null lens: it may load p.lens[0] whatever the null
++// test says, which crashes software Vulkan (lavapipe). Zeros read as "no lens".
++uint64_t lens_or_off() {
++    if (g_lens_defocus) return g_lens_defocus;
++    static void* off = nullptr;
++    if (!off) {
++        off = backend::device_malloc_checked(64 * 16, "lens off");
++        backend::memset_sync(off, 0, 64 * 16);
++    }
++    return (uint64_t)off;
++}
++
  // Mirrors ProjectionFwdParams in shaders/projection_fwd.slang.
  struct ProjectionFwdParams {
      uint64_t means, quats, scales, opacities, features_dc, features_sh;
-@@ -23,8 +25,9 @@ struct ProjectionFwdParams {
+@@ -23,8 +38,9 @@ struct ProjectionFwdParams {
      uint32_t wgs_per_row;
      uint32_t num_sh_buffer;
      uint32_t _pad0;
@@ -2694,15 +2731,15 @@ index ae0d78b6..e03ed10d 100644
                "params layout must match the slang struct");
  
  // Mirrors Projection3dgutParams in shaders/projection_fwd.slang.
-@@ -117,6 +120,7 @@ launch_projection_fwd_vk(
+@@ -117,6 +133,7 @@ launch_projection_fwd_vk(
      p.width = image_width;
      p.height = image_height;
      p.wgs_per_row = per_row;
-+    p.lens = g_lens_defocus;
++    p.lens = lens_or_off();
  
      backend::vk::SpecList spec{cd.cam, (uint32_t)sh_degree,
                                 antialiased ? 1u : 0u, spec_bits, 0u, cd.dist};
-@@ -128,6 +132,10 @@ launch_projection_fwd_vk(
+@@ -128,6 +145,10 @@ launch_projection_fwd_vk(
  
  }  // namespace
  
@@ -2785,10 +2822,10 @@ index ef7b72da..9f612088 100644
                      (uint32_t)batch, tile_width, tile_height, macro_log2, &p,
                      sizeof(p));
 diff --git a/src/backend/vulkan/shaders/projection_fwd.slang b/src/backend/vulkan/shaders/projection_fwd.slang
-index 9c30e617..32efd058 100644
+index 9c30e617..4c56a5c7 100644
 --- a/src/backend/vulkan/shaders/projection_fwd.slang
 +++ b/src/backend/vulkan/shaders/projection_fwd.slang
-@@ -93,8 +93,62 @@ struct ProjectionFwdParams {
+@@ -93,8 +93,113 @@ struct ProjectionFwdParams {
      uint32_t wgs_per_row; // grid fold (flat id = wg.y * wgs_per_row*128 + x)
      uint32_t num_sh_buffer;
      uint32_t _pad0;
@@ -2804,10 +2841,21 @@ index 9c30e617..32efd058 100644
 +                inout float4 aabb, inout float3 rgb) {
 +    float4 L0 = L[0];
 +    float k = L0.y - 1.0f / mean_c.z;
-+    float2 half_size = float2(W, H) * 0.5f;
-+    float2 qv = (xy - half_size) / length(half_size);
++    float2 centre = float2(W, H) * 0.5f;
++    float radius = length(centre);
++    // Field rows (L[1].y = 1): focus varying over the frame, the cell's lens
++    // point, an oval aperture, and where the optical axis is in this render.
++    bool fieldRows = L[1].y > 0.5f;
++    float4 tilt = fieldRows ? L[kLensTable + 2] : float4(0);
++    float4 cellRow = fieldRows ? L[kLensTable + 3] : float4(0);
++    if (fieldRows) {
++        centre = L[kLensTable + 4].xy;
++        radius = L[kLensTable + 4].z;
++    }
++    float2 qv = (xy - centre) / radius;
 +    float ql = length(qv);
 +    float2 qd = ql > 1e-4f ? qv / ql : float2(1, 0);
++    float2 qp = float2(-qd.y, qd.x);
 +    float a2 = L0.z * L0.z;
 +    float2 mu = 0;
 +    float2x2 S;
@@ -2817,16 +2865,56 @@ index 9c30e617..32efd058 100644
 +        int i0 = min(int(t), kLensTable - 2);
 +        float4 m = lerp(L[2 + i0], L[3 + i0], t - float(i0));
 +        mu = qd * (m.x * L0.z);
-+        float2 qp = float2(-qd.y, qd.x);
 +        S = (m.y * a2) * float2x2(qd.x * qd.x, qd.x * qd.y, qd.x * qd.y, qd.y * qd.y) +
 +            (m.z * a2) * float2x2(qp.x * qp.x, qp.x * qp.y, qp.x * qp.y, qp.y * qp.y);
 +        light = m.w;
 +    } else {
 +        S = float2x2(L[1].x * a2, 0, 0, L[1].x * a2);
 +    }
-+    float2 f = float2(fx, fy) * k;
-+    float2x2 B = float2x2(f.x * f.x * S[0][0], f.x * f.y * S[0][1],
-+                          f.x * f.y * S[1][0], f.y * f.y * S[1][1]);
++    // The barrel cuts a cell's patch of lens with a chord: keep the part inside,
++    // centred where it is (row 37; maths in docs/notes/lens-defocus.md).
++    float4 barrel = fieldRows ? L[kLensTable + 5] : float4(0);
++    if (barrel.z > 0) {
++        float2 l0 = cellRow.xy / L0.z;
++        l0.x /= cellRow.z > 0 ? cellRow.z : 1.0f;
++        float2 b = l0 * barrel.y + barrel.x * qv;
++        float bl = length(b);
++        float t = clamp((1 - bl) / barrel.y / barrel.z, -1.0f, 1.0f);
++        if (t <= -1) return false;
++        if (t < 1) {
++            float r = sqrt(1 - t * t);
++            float kept = 3.14159265f - (acos(t) - t * r);
++            float2 n = b / max(bl, 1e-6f);
++            mu -= n * ((2.0f / 3.0f) * r * r * r / kept * barrel.z * L0.z);
++            rgb *= kept / 3.14159265f;
++            float w = kept / 3.14159265f;
++            S -= (1 - w * w) * S[0][0] * float2x2(n.x * n.x, n.x * n.y, n.x * n.y, n.y * n.y);
++        }
++    }
++    // Spherical aberration spreads a cell's neighbours apart radially: widen it to match.
++    if (cellRow.w != 0 && a2 > 0) {
++        float sa = cellRow.w * dot(cellRow.xy, cellRow.xy) / a2;
++        float g = clamp(abs(k + 2 * sa) / max(abs(k), 1e-6f), 1.0f, 8.0f);
++        float2 cd = normalize(cellRow.xy + float2(1e-9f, 0));
++        S += (g * g - 1) * S[0][0] * float2x2(cd.x * cd.x, cd.x * cd.y, cd.x * cd.y, cd.y * cd.y);
++    }
++    // An oval stop (an anamorphic-look insert) narrows the pupil across.
++    float sq = cellRow.z > 0 ? cellRow.z : 1.0f;
++    S[0][0] *= sq * sq;
++    S[0][1] *= sq;
++    S[1][0] *= sq;
++    mu.x *= sq;
++    // Focus off the axis: tilt and field curvature (docs/notes/lens-defocus.md).
++    float dk = tilt.x * qv.x + tilt.y * qv.y;
++    float kr = k + dk + tilt.z * ql * ql, kt = k + dk + tilt.w * ql * ql;
++    float2x2 P = float2x2(qd.x * qd.x, qd.x * qd.y, qd.x * qd.y, qd.y * qd.y);
++    float2x2 Q = float2x2(qp.x * qp.x, qp.x * qp.y, qp.x * qp.y, qp.y * qp.y);
++    float2x2 M = kr * P + kt * Q;
++    float2x2 F = float2x2(fx * M[0][0], fx * M[0][1], fy * M[1][0], fy * M[1][1]);
++    float2x2 B = mul(mul(F, S), transpose(F));
++    // A cell's view is already sheared for k; add the field's extra shift.
++    float2x2 E = M - float2x2(k, 0, 0, k);
++    xy += float2(fx, fy) * mul(E, cellRow.xy);
 +    // Cap the blur so a wildly defocused splat cannot cover the whole frame.
 +    float maxv = L[1].w * L[1].w;
 +    float tr = B[0][0] + B[1][1];
@@ -2840,7 +2928,7 @@ index 9c30e617..32efd058 100644
 +    if (opac < ALPHA_THRESHOLD) return false;
 +    float2x2 Ci = inverse(C);
 +    conic = float3(Ci[0][0], Ci[0][1], Ci[1][1]);
-+    xy += f * mu;
++    xy += mul(F, mu);
 +    rgb *= light;
 +    float extend = min(3.33f, sqrt(2.0f * log(opac / ALPHA_THRESHOLD)));
 +    float rx = extend * sqrt(C[0][0]), ry = extend * sqrt(C[1][1]);
@@ -2851,11 +2939,35 @@ index 9c30e617..32efd058 100644
  void run_projection<let cam: CameraModelType, D : ICameraDistortion>(
      ProjectionFwdParams p, uint idx) {
      uint cid = (idx / p.N) % p.C;
-@@ -143,6 +197,12 @@ void run_projection<let cam: CameraModelType, D : ICameraDistortion>(
+@@ -130,12 +235,21 @@ void run_projection<let cam: CameraModelType, D : ICameraDistortion>(
+     float s_depth;
+     float3 s_conic;
+     float s_opac;
++    // With a lens, splats just outside the image blur into it: project as if
++    // the image were bigger by the largest blur, then shift back.
++    bool lensOn = !is_null(p.lens) && p.lens[0].x > 0.5f;
++    // (A capped blur can reach ~4.7 sigma_max: 3.33 x sqrt(2) x the cap.)
++    float m = lensOn ? min(5.0f * p.lens[1].w, 16384.0f) : 0.0f;
+     projection_3dgs<cam, D, false, false>(
+         kAntialiased != 0,
+         mean, quat, scale, in_opacity, R, t,
+-        intrin.x, intrin.y, intrin.z, intrin.w, dist,
+-        p.width, p.height,
++        intrin.x, intrin.y, intrin.z + m, intrin.w + m, dist,
++        p.width + uint(2 * m), p.height + uint(2 * m),
+         aabb, sorting_depth, radius, s_xy, s_depth, s_conic, s_opac);
++    if (m > 0) {
++        s_xy -= m;
++        if (aabb.z > aabb.x && aabb.w > aabb.y) aabb -= m;
++    }
+ 
+     // SH -> rgb, gated exactly like _Base3DGS::project.
+     float3 rgb = float3(0.0f);
+@@ -143,6 +257,12 @@ void run_projection<let cam: CameraModelType, D : ICameraDistortion>(
          rgb = eval_splat_color(mean, R, t, dc, p.features_sh, p.sh_stride,
                                 gid, p.sh_packed, p.sh_bounds,
                                 p.num_sh_buffer, i64mem_get(p.sh_bounds_stride));
-+    if (!is_null(p.lens) && aabb.z > aabb.x && aabb.w > aabb.y && p.lens[0].x > 0.5f) {
++    if (lensOn && aabb.z > aabb.x && aabb.w > aabb.y) {
 +        float3 mean_c = mul(R, mean) + t;
 +        if (!apply_lens(p.lens, mean_c, intrin.x, intrin.y, p.width, p.height,
 +                        s_xy, s_conic, s_opac, aabb, rgb))
@@ -2925,10 +3037,10 @@ index 16a25dd5..40378811 100644
              float2 delta = float2(f.xy.x - px, f.xy.y - py);
 diff --git a/src/blender/SplatRenderC.cpp b/src/blender/SplatRenderC.cpp
 new file mode 100644
-index 00000000..dd88d8cd
+index 00000000..969b4a82
 --- /dev/null
 +++ b/src/blender/SplatRenderC.cpp
-@@ -0,0 +1,292 @@
+@@ -0,0 +1,305 @@
 +// A C interface to Spirula's 3DGS renderer, for loading into another process
 +// (the Blender render engine add-on calls it through ctypes).
 +//
@@ -2974,6 +3086,9 @@ index 00000000..dd88d8cd
 +    for (auto& f : g_frames) backend::device_free(f.ptr);
 +    g_frames.clear();
 +}
++
++// Camera model for renders: "PINHOLE" or "FISHEYE" (equidistant), sr_set_camera_model.
++std::string g_camera_model = "PINHOLE";
 +
 +// Thin-lens parameters on the GPU (sr_set_lens).
 +void* g_lens = nullptr;
@@ -3052,7 +3167,7 @@ index 00000000..dd88d8cd
 +        if (g_num <= 0) throw std::runtime_error("no splats loaded");
 +        const std::vector<float> intr = {fx, fy, cx, cy};
 +        const std::vector<float> dist(kCameraDistortionParams, 0.0f);
-+        set_camera_params(width, height, "PINHOLE", "NONE", ttv(viewmat, {1, 4, 4}),
++        set_camera_params(width, height, g_camera_model, "NONE", ttv(viewmat, {1, 4, 4}),
 +                          ttv(intr.data(), {1, 4}),
 +                          ttv(dist.data(), {1, kCameraDistortionParams}));
 +        forward_3dgs(primitive ? primitive : "3dgs", render_degree(), false, false, 0);
@@ -3097,7 +3212,7 @@ index 00000000..dd88d8cd
 +        if (g_num <= 0) throw std::runtime_error("no splats loaded");
 +        const std::vector<float> intr = {fx, fy, cx, cy};
 +        const std::vector<float> dist(kCameraDistortionParams, 0.0f);
-+        set_camera_params(width, height, "PINHOLE", "NONE", ttv(viewmat, {1, 4, 4}),
++        set_camera_params(width, height, g_camera_model, "NONE", ttv(viewmat, {1, 4, 4}),
 +                          ttv(intr.data(), {1, 4}),
 +                          ttv(dist.data(), {1, kCameraDistortionParams}));
 +        forward_3dgs(primitive ? primitive : "3dgs", render_degree(), false, out_median != nullptr, 0);
@@ -3160,7 +3275,7 @@ index 00000000..dd88d8cd
 +        const int width = g_frames[frame].w, height = g_frames[frame].h;
 +        const std::vector<float> intr = {fx, fy, cx, cy};
 +        const std::vector<float> dist(kCameraDistortionParams, 0.0f);
-+        set_camera_params(width, height, "PINHOLE", "NONE", ttv(viewmat, {1, 4, 4}),
++        set_camera_params(width, height, g_camera_model, "NONE", ttv(viewmat, {1, 4, 4}),
 +                          ttv(intr.data(), {1, 4}),
 +                          ttv(dist.data(), {1, kCameraDistortionParams}));
 +        forward_3dgs(primitive ? primitive : "3dgs", render_degree(), false, true, 0);
@@ -3211,6 +3326,16 @@ index 00000000..dd88d8cd
 +    });
 +}
 +
++// "PINHOLE" (rectilinear, the default) or "FISHEYE" (equidistant: image
++// radius = f * angle off axis) for the renders that follow.
++SR_API int sr_set_camera_model(const char* name) {
++    return guarded([&] {
++        std::string m = name ? name : "PINHOLE";
++        if (m != "PINHOLE" && m != "FISHEYE") throw std::runtime_error("camera model must be PINHOLE or FISHEYE");
++        g_camera_model = m;
++    });
++}
++
 +SR_API void sr_shutdown() {
 +    backend::vk::set_lens_defocus(nullptr);
 +    if (g_lens) backend::device_free(g_lens);
@@ -3233,10 +3358,10 @@ index 00000000..c26317d3
 +};
 diff --git a/src/blender/exports.txt b/src/blender/exports.txt
 new file mode 100644
-index 00000000..bcf61824
+index 00000000..76322aa2
 --- /dev/null
 +++ b/src/blender/exports.txt
-@@ -0,0 +1,12 @@
+@@ -0,0 +1,13 @@
 +_sr_last_error
 +_sr_set_splats
 +_sr_render
@@ -3249,6 +3374,7 @@ index 00000000..bcf61824
 +_sr_set_lens
 +_sr_add_shared_frames
 +_sr_color_buffer
++_sr_set_camera_model
 diff --git a/src/config/TrainConfig.h b/src/config/TrainConfig.h
 index 04df5cd5..70178fb3 100644
 --- a/src/config/TrainConfig.h
