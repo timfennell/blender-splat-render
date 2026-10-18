@@ -335,12 +335,12 @@ float s2l(float c) { return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 
 void main() {
     vec2 size = P[0].xy, axis = P[0].zw;
     vec2 px = v_uv * size;
-    vec3 lin = texture(img, v_uv).rgb;
+    vec3 lin = texture(img, v_uv).rgb * P[8].y;
     if (P[1].z > 0.5) {
         /* the lens: lateral colour and fall-off (Vintage Click's develop) */
         float k = P[1].y;
-        lin.r = texture(img, (axis + (px - axis) * (1.0 - k)) / size).r;
-        lin.b = texture(img, (axis + (px - axis) * (1.0 + k)) / size).b;
+        lin.r = texture(img, (axis + (px - axis) * (1.0 - k)) / size).r * P[8].y;
+        lin.b = texture(img, (axis + (px - axis) * (1.0 + k)) / size).b * P[8].y;
         vec2 q = (px - axis) / length(size * 0.5);
         lin *= max(1.0 - P[1].x * dot(q, q), 0.0);
     }
@@ -365,13 +365,14 @@ void main() {
     return _SHADERS["film"]
 
 
-def film_pass(tex, W, H, axis, lens=None, n=None, film=None, push=0, stops=0.0):
+def film_pass(tex, W, H, axis, lens=None, n=None, film=None, push=0, stops=0.0, gain=1.0):
     """The viewport's look through a lens and film from Vintage Click: fall-off and lateral
     colour (in camera view), the stock's colour and curve. Grain, halation and streaks are
     final-render only. Returns an RGBA16F texture of linear values."""
     from . import optics
     P = [[float(W), float(H), float(axis[0]), float(axis[1])], [0.0, 0.0, 0.0, 1.0]]
     P += [[0.0] * 4 for _ in range(7)]
+    P[8][1] = float(gain)                     # light lost focusing close (through the camera)
     if lens is not None:
         P[1][0] = lens["vignette"] * min(1.0, lens["maxAperture"] / n) ** 1.5
         P[1][1] = lens["lateralCA"]

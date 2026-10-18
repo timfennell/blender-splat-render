@@ -193,6 +193,33 @@ def field_focus(lens, metres_per_unit, tilt, qx, qy):
     return tx * qx + ty * qy + curv * (qx * qx + qy * qy)
 
 
+# ---------------------------------------------------------------- focusing close
+
+def magnification(lens, focus_m):
+    """The lens's magnification focused at `focus_m` (thin lens, m = f / (s - f), blended near
+    the closest focus toward the published figure: a macro's 1:2 or 1:1). (CameraBody)"""
+    f = lens["focalMM"] / 1000
+    focus_m = max(focus_m, lens["minFocusM"])          # the focus ring stops at the closest focus
+    simple = f / max(focus_m - f, f * 0.05)
+    if lens.get("maxMagnification", 0) <= 0:
+        return simple
+    at_closest = f / max(lens["minFocusM"] - f, f * 0.05)
+    k = lens["maxMagnification"] / at_closest
+    t = min(1.0, lens["minFocusM"] / max(focus_m, lens["minFocusM"]))
+    return simple * (1 + (k - 1) * t * t)
+
+
+def close_focus_loss(lens, focus_m):
+    """Stops lost focusing close (the bellows factor: effective aperture N (1 + m))."""
+    return 2 * math.log2(1 + magnification(lens, focus_m))
+
+
+def breathing_scale(lens, focus_m):
+    """How much the picture grows focusing close: 1 + m as the whole lens moves out (focus
+    breathing); an internal-focus lens (breathing < 0) widens a little instead."""
+    return max(0.5, 1 + lens.get("breathing", 1.0) * magnification(lens, focus_m))
+
+
 # ---------------------------------------------------------------- film
 
 def developed(stock, push):

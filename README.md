@@ -89,7 +89,13 @@ so the lens's character comes from the same code as in the game:
   curves (Petzval, Helios-type, reversed elements);
 - spherical-aberration glow wide open, axial colour fringes in the bokeh (64+ samples), lateral
   colour and light fall-off toward the corners, a mod's horizontal streak flares;
-- tilt (the Bendy: Tilt in the panel) and shift (PC lenses: the camera's own Shift X / Y).
+- tilt (the Bendy: Tilt in the panel) and shift (PC lenses: the camera's own Shift X / Y);
+- focusing close as a real lens does: the magnification at the focused distance (the macros
+  reach their published 1:2 or 1:1), the light lost to it (the bellows factor, N (1 + m): a
+  third of a stop for a 50 mm at 0.45 m, two stops for the 60 mm macro at 1:1) and focus
+  breathing (the picture grows by 1 + m; the internal-focus 200 mm widens a little instead). The
+  panel shows both for the current focus, to compensate with Film Exposure. Breathing is in
+  final renders (the camera's focal length is scaled for the render and put back after).
 
 Meshes follow every sub-pupil too, including the tilted or curved focus and the barrel's
 clipping. Looking through the scene camera, the viewport shows the lens's depth of field as the

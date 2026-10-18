@@ -122,6 +122,15 @@ class SpirulaSettings(bpy.types.PropertyGroup):
     lens_tilt: bpy.props.FloatVectorProperty(
         name="Tilt", size=2, default=(0.0, 0.0), soft_min=-15, soft_max=15, subtype='XYZ',
         description="Tilt lens only: tilt of the focus plane, degrees (x across the frame, y up and down)")
+    use_breathing: bpy.props.BoolProperty(
+        name="Focus Breathing", default=True,
+        description="Final renders: the picture grows as the lens focuses close (1 + magnification), "
+                    "or shrinks a little on an internal-focus lens, as in Vintage Click")
+    use_close_focus_loss: bpy.props.BoolProperty(
+        name="Close-Focus Light Loss", default=True,
+        description="The light lost focusing close (the bellows factor, effective aperture N (1 + m)): "
+                    "a third of a stop for a 50 mm at 0.45 m, two stops for a macro at 1:1. "
+                    "Compensate with Film Exposure, as a hand-held meter reading would need")
     film: bpy.props.EnumProperty(
         name="Film", items=film_items,
         description="Develop final renders on a film stock from Vintage Click: its curve, colour, grain, halation")
@@ -183,6 +192,18 @@ class SPIRULA_PT_render(bpy.types.Panel):
             col = box.column(align=True)
             col.label(text=lens["inspiredBy"])
             col.label(text="f/%g - f/%g, focuses to %g m" % (lens["maxAperture"], lens["minAperture"], lens["minFocusM"]))
+            cam = context.scene.camera
+            if cam is not None and cam.type == 'CAMERA':
+                from .engine import camera_focus_m
+                fm = camera_focus_m(context.scene, cam)
+                m = optics.magnification(lens, fm)
+                col.label(text="At %.2f m: 1:%.1f, %.2f stops lost, view x%.2f" % (
+                    fm, 1 / max(m, 1e-6), optics.close_focus_loss(lens, fm), optics.breathing_scale(lens, fm)))
+                if fm < lens["minFocusM"] * 0.98:
+                    col.label(text="Closer than this lens focuses (%g m)" % lens["minFocusM"], icon='ERROR')
+            row = box.row()
+            row.prop(s, "use_breathing")
+            row.prop(s, "use_close_focus_loss")
             mv = lens.get("movement") or {}
             if mv.get("kind") == "tilt":
                 box.prop(s, "lens_tilt")
@@ -274,9 +295,13 @@ def register():
     bpy.utils.register_class(SPIRULA_PT_object)
     _panels(True)
     meshes.register()
+    from . import engine as _engine
+    _engine.register_handlers()
 
 
 def unregister():
+    from . import engine as _engine
+    _engine.unregister_handlers()
     meshes.unregister()
     _panels(False)
     bpy.utils.unregister_class(SPIRULA_PT_object)

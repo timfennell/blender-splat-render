@@ -20,7 +20,8 @@ OUT = os.path.join(os.path.dirname(HERE), "spirula_render", "optics.json")
 
 LENS_DEFAULTS = dict(lateralCA=0.0005, axialCA=0.0, projection="rectilinear", obstruction=0.0,
                      sphericalAberration=0.0, squeeze=1.0, curvatureRadial=0.0,
-                     curvatureTangential=0.0, movement=None, streak=0.0)
+                     curvatureTangential=0.0, movement=None, streak=0.0, maxMagnification=0.0,
+                     breathing=1.0, rearFilter=False)
 FILM_DEFAULTS = dict(blackAndWhite=False, bwMix=[0.30, 0.59, 0.11],
                      crosstalk=[[1, 0, 0], [0, 1, 0], [0, 0, 1]], balance=[1, 1, 1],
                      saturation=1.0, contrast=1.0, toe=1.0, shoulder=1.0, blackLift=0.02,

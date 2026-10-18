@@ -337,6 +337,71 @@ def _dof_samples(dof, n, cam_world, fx, fy, cx, cy, W, H, settings, test_break=N
         yield _to_linear(rgb, alpha, settings), alpha, d, dx, dy
 
 
+def camera_focus_m(scene, cam_obj):
+    """Where the scene camera is focused, in metres along its view axis (focus object, else
+    focus distance), whether or not depth of field is on."""
+    dof = cam_obj.data.dof
+    C = np.array(cam_obj.matrix_world, np.float64)
+    if dof.focus_object is not None:
+        fwd = -C[:3, 2] / np.linalg.norm(C[:3, 2])
+        d = float((np.array(dof.focus_object.matrix_world.translation, np.float64) - C[:3, 3]) @ fwd)
+    else:
+        d = float(dof.focus_distance)
+    return max(d, 1e-6) * (float(scene.unit_settings.scale_length) or 1.0)
+
+
+_BREATHING_KEY = "_spirula_focal_before_breathing"
+
+
+@bpy.app.handlers.persistent
+def _breathing_pre(scene, *_):
+    """Focus breathing in final renders: the lens's picture grows (or an internal-focus lens's
+    shrinks) with its magnification, so the camera's focal length is scaled for the render
+    -- splats and Cycles' meshes both read it -- and put back after (_breathing_post). The
+    original is kept on the camera, so a crash mid-render still gets it back (on load)."""
+    if scene.render.engine != 'SPIRULA' or not scene.spirula.use_breathing:
+        return
+    lens, _ = optics.chosen(scene.spirula)
+    cam = scene.camera
+    if lens is None or cam is None or cam.type != 'CAMERA':
+        return
+    data = cam.data
+    if _BREATHING_KEY in data:
+        data.lens = data[_BREATHING_KEY]
+    k = optics.breathing_scale(lens, camera_focus_m(scene, cam))
+    if abs(k - 1) < 1e-6:
+        return
+    data[_BREATHING_KEY] = data.lens
+    data.lens = data.lens * k
+
+
+@bpy.app.handlers.persistent
+def _breathing_post(scene, *_):
+    for cam in bpy.data.cameras:
+        if _BREATHING_KEY in cam:
+            cam.lens = cam[_BREATHING_KEY]
+            del cam[_BREATHING_KEY]
+
+
+def register_handlers():
+    for h, fn in ((bpy.app.handlers.render_pre, _breathing_pre),
+                  (bpy.app.handlers.render_post, _breathing_post),
+                  (bpy.app.handlers.render_cancel, _breathing_post),
+                  (bpy.app.handlers.load_post, _breathing_post)):
+        if fn not in h:
+            h.insert(0, fn) if h is bpy.app.handlers.render_pre else h.append(fn)
+
+
+def unregister_handlers():
+    _breathing_post(None)
+    for h, fn in ((bpy.app.handlers.render_pre, _breathing_pre),
+                  (bpy.app.handlers.render_post, _breathing_post),
+                  (bpy.app.handlers.render_cancel, _breathing_post),
+                  (bpy.app.handlers.load_post, _breathing_post)):
+        if fn in h:
+            h.remove(fn)
+
+
 def _lens_cells(lens, n, dof, count, cam_world, fx, fy, cx, cy, W, H, settings, tilt,
                 test_break=None, stats=None):
     """An exposure through a lens from the camera game's bag: `count` sub-pupils (cells),
@@ -578,6 +643,10 @@ class SpirulaRenderEngine(bpy.types.RenderEngine):
         film_transparent = meshes.original_film_transparent(scene)
         world = tuple(scene.world.color)[:3] if scene.world else (0.05, 0.05, 0.05)
         scene_frame = scene.frame_current
+        loss_stops = 0.0
+        lens_now, _ = optics.chosen(settings)
+        if lens_now is not None and settings.use_close_focus_loss:
+            loss_stops = optics.close_focus_loss(lens_now, camera_focus_m(scene, bpy.data.objects.get(cam_obj.name) or cam_obj))
         frozen = _freeze(depsgraph)
         dof = _dof_params(scene, cam_obj, cam_world) if settings.dof_samples > 1 else None
         # Show the previous frame's finished image until this one is ready.
@@ -677,7 +746,7 @@ class SpirulaRenderEngine(bpy.types.RenderEngine):
         if lens is not None or film is not None:
             t2 = time.time()
             rgba = self._finish(rgba, settings, lens, n_stop, film, (cx, cy), world, film_transparent,
-                                scene_frame)
+                                scene_frame, loss_stops)
             print(f"Spirula: lens and film finishing in {time.time() - t2:.2f}s")
         self._write(rgba, depth, ray, film_transparent, world, W, H, remember=True)
 
@@ -733,7 +802,8 @@ class SpirulaRenderEngine(bpy.types.RenderEngine):
         print(f"Spirula: {done} cells through the {lens['name']} at f/{n:g} in {time.time() - t1:.2f}s")
         return rgba, depth
 
-    def _finish(self, rgba, settings, lens, n, film, axis, world, film_transparent, frame):
+    def _finish(self, rgba, settings, lens, n, film, axis, world, film_transparent, frame,
+                loss_stops=0.0):
         """Lens fall-off, lateral colour and streaks, then the film (curve, colour, grain,
         halation), on the frame with its background. Returns premultiplied rgba."""
         rgba = rgba.copy()
@@ -745,7 +815,7 @@ class SpirulaRenderEngine(bpy.types.RenderEngine):
         else:
             lin = np.where(a > 1e-6, rgba[..., :3] / np.maximum(a, 1e-6), 0.0)
         if lens is not None:
-            lin = optics.lens_finish(lin, lens, n, axis)
+            lin = optics.lens_finish(lin, lens, n, axis) * np.float32(2.0 ** -loss_stops)
             if lens["streak"] > 0:
                 lin = lin + optics.streak(lin, lens["streak"])
         if film is not None:
@@ -1074,9 +1144,12 @@ class SpirulaRenderEngine(bpy.types.RenderEngine):
             cam = scene.camera
             if lens is not None and cam is not None and cam.type == 'CAMERA':
                 n = min(max(cam.data.dof.aperture_fstop, lens["maxAperture"]), lens["minAperture"])
+            loss = 0.0
+            if lens is not None and through_camera and cam is not None and settings.use_close_focus_loss:
+                loss = optics.close_focus_loss(lens, camera_focus_m(scene, cam))
             tex = viewport_meshes.film_pass(tex, tex.width, tex.height, (tex.width / 2, tex.height / 2),
                                             lens if through_camera else None, n, film,
-                                            settings.film_push, settings.film_exposure)
+                                            settings.film_push, settings.film_exposure, 2.0 ** -loss)
         gpu.state.blend_set('ALPHA_PREMULT')
         self.bind_display_space_shader(scene)
         draw_texture_2d(tex, (0, 0), region.width, region.height)
