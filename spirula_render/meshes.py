@@ -220,6 +220,16 @@ def prepare_cycles(scene, view_layer):
                              "visible_transmission", "visible_volume_scatter", "visible_shadow"):
                     _set(ob, attr, False, store)
         _set(scene.render, "film_transparent", True, store)
+        # We read Cycles' finished passes back in one piece, and they come back empty when
+        # Cycles splits the render into tiles (anything over the 2048 default): make one
+        # tile cover the whole image. Cycles allows tiles up to 8192.
+        r = scene.render
+        need = max(r.resolution_x, r.resolution_y) * r.resolution_percentage // 100
+        _set(scene.cycles, "use_auto_tile", True, store)
+        if scene.cycles.tile_size < need:
+            _set(scene.cycles, "tile_size", min(need, 8192), store)
+        if need > 8192:
+            print("Spirula: renders over 8192 px can't fit one Cycles tile; meshes may be missing")
         # meshes are rendered pinhole: depth of field is done for meshes and splats together
         cam = scene.camera
         if cam is not None and cam.type == 'CAMERA':
