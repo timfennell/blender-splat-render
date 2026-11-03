@@ -25,7 +25,9 @@ into the lens, the 25 [lens filters](#lenses-and-film-from-vintage-click) from V
 correction), and its rangefinder lenses. Since 0.13 the flare and gratings follow each light's
 spectrum, and old lenses' ghosts show dust, scratches, fungus and bubbles.
 
-![A bee scan backlit through a diffraction grating: rainbow spikes off the light and the rim-lit hairs](docs/lens_filters_hero.jpg)
+![A bee scan backlit by a tungsten lamp through a diffraction grating: the lamp's own spectrum fanned along the spikes, order after order, and rainbow halos off the rim-lit hairs](docs/lens_filters_hero.jpg)
+
+*The full 3-million-splat bee through the Spectral Star 042 grating, lit from behind by a tungsten lamp.*
 
 ## Install
 
@@ -134,11 +136,19 @@ blue band then yellow, a fluorescent tube's separate coloured dots (its lines), 
 sodium lamp's single orange dots. Highlights in the scan spike from a smooth spectrum fitted to
 their colour. The spectra and gel curves come from Vintage Click (`tools/make_spectra.py` there).
 
+![The same grating on four lamps: tungsten and white LED give continuous rainbows (the LED's blue band stronger), a fluorescent tube breaks into separate coloured dots, and a low-pressure sodium lamp gives single orange dots](docs/grating_spectra.jpg)
+
+*One grating, four lamps: each spreads its own spectrum.*
+
 Old glass shows its age in the ghosts, as in the game. Every bag lens carries some dust (dark
 specks with a faint bright fringe), the old, rare and home-made ones more, with cleaning marks,
 coating scratches (which also throw soft streaks through a bright light) and on some of them fungus
 (a dark branching lace). The Soviet and old Jena glass has seed bubbles. Worn glass scatters more
 glare. Each lens's flaws are its own, and each ghost shows those of a different element.
+
+![Close-ups of flare ghosts: the Petzval's show fungus lace, dust and cleaning arcs; the Soviet Solnce's show seed bubbles and dust, their edges fringing continuously from red to violet](docs/old_glass.jpg)
+
+*Ghosts close up, from the full-bee renders above.*
 
 ![A spotlight behind a bee scan, shining into the lens: a multi-coated 50 mm at f/8 throws a faint ghost and a starburst; a single-coated Petzval washes the frame with glare and bright coloured ghosts](docs/lens_flare.jpg)
 

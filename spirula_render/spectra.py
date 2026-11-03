@@ -71,7 +71,7 @@ def spectrum(kind, colour=(1, 1, 1), temperature=3200.0):
     if kind == 'SODIUM':
         return 0.03 + g(583, 38) * (1 - 0.85 * g(589, 6)) + 0.35 * _line(wl, 569) + 0.2 * _line(wl, 616) + 0.08 * _line(wl, 498)
     if kind == 'LOW_SODIUM':
-        return 0.002 + _line(wl, 589, 3.0)
+        return 0.0001 + _line(wl, 589, 3.0)
     if kind == 'MERCURY':
         return 0.02 + 0.6 * _line(wl, 405) + 1.3 * _line(wl, 436) + 1.6 * _line(wl, 546) + 1.0 * _line(wl, 578)
     # from colour: the smooth basis the game fits to a scene highlight's colour
