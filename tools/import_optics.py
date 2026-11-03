@@ -1,9 +1,10 @@
-"""Read the lenses and film stocks from Splat Camera's Swift source into optics.json.
+"""Read the lenses, film stocks and lens filters from Vintage Click's Swift source into optics.json.
 
     python tools/import_optics.py [path/to/splat_camera]
 
-Splat Camera (the vintage camera game) is the master copy: its Lens.swift and FilmStock.swift
-hold the camera bag and the film fridge as literal lists. This reads those literals (it is not
+Vintage Click (the vintage camera game, formerly Splat Camera) is the master copy: its Lens.swift,
+FilmStock.swift and Filters.swift hold the camera bag, the film fridge and the filters as literal
+lists. This reads those literals (it is not
 a Swift parser: it knows the shape of `Lens(name: ..., focalMM: ...)` and `FilmStock(...)`
 calls), fills in the struct defaults, and writes spirula_render/optics.json. Re-run it after
 changing a lens or a stock in the game. Fisheyes are left out (the engine draws perspective
@@ -22,6 +23,8 @@ LENS_DEFAULTS = dict(lateralCA=0.0005, axialCA=0.0, projection="rectilinear", ob
                      sphericalAberration=0.0, squeeze=1.0, curvatureRadial=0.0,
                      curvatureTangential=0.0, movement=None, streak=0.0, maxMagnification=0.0,
                      breathing=1.0, rearFilter=False)
+FILTER_DEFAULTS = dict(transmission=[1.0, 1.0, 1.0], starPoints=0, starStrength=0.0, spectral=False,
+                       glow=0.0, soften=0.0, veil=0.0)
 FILM_DEFAULTS = dict(blackAndWhite=False, bwMix=[0.30, 0.59, 0.11],
                      crosstalk=[[1, 0, 0], [0, 1, 0], [0, 0, 1]], balance=[1, 1, 1],
                      saturation=1.0, contrast=1.0, toe=1.0, shoulder=1.0, blackLift=0.02,
@@ -88,6 +91,15 @@ def value(v):
         return json.loads(v)
     if v in ("true", "false"):
         return v == "true"
+    m = re.fullmatch(r"SIMD3(?:<Float>)?\(repeating: ([^)]+)\)", v)
+    if m:
+        return [value(m.group(1))] * 3
+    m = re.fullmatch(r"SIMD3(?:<Float>)?\(([^)]+)\)", v)
+    if m:
+        return [value(x) for x in m.group(1).split(",")]
+    m = re.fullmatch(r"([\d.]+)\s*/\s*([\d.]+)", v)
+    if m:
+        return float(m.group(1)) / float(m.group(2))
     if v.startswith("mix("):
         return [value(r) for r in re.findall(r"\[[^\]]*\]", v)]
     if v.startswith("["):
@@ -134,9 +146,19 @@ def main():
         d.update({k: value(v) for k, v in split_args(body).items()})
         films.append(d)
 
-    json.dump({"source": "Splat Camera (Lens.swift, FilmStock.swift)", "collections": collections,
-               "lenses": lenses, "films": films}, open(OUT, "w"), indent=1)
-    print(f"{len(lenses)} lenses in {len(collections)} collections, {len(films)} film stocks -> {OUT}")
+    filters = []
+    filter_src = open(os.path.join(game, "Sources/SplatCamera/Filters.swift")).read()
+    start = filter_src.index("let lensFilters: [LensFilter] = [")
+    end = filter_src.index("\n]", start)
+    for body in calls(filter_src[start:end], "LensFilter"):
+        d = dict(FILTER_DEFAULTS)
+        d.update({k: value(v) for k, v in split_args(body).items()})
+        filters.append(d)
+
+    json.dump({"source": "Vintage Click (Lens.swift, FilmStock.swift, Filters.swift)", "collections": collections,
+               "lenses": lenses, "films": films, "filters": filters}, open(OUT, "w"), indent=1)
+    print(f"{len(lenses)} lenses in {len(collections)} collections, {len(films)} film stocks, "
+          f"{len(filters)} filters -> {OUT}")
 
 
 if __name__ == "__main__":

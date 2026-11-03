@@ -13,6 +13,23 @@ def _slug(name):
 
 _LENS_ITEMS = []
 _FILM_ITEMS = []
+_FILTER_ITEMS = []
+
+
+def filter_items(self, context):
+    """Vintage Click's filters, group by group."""
+    if not _FILTER_ITEMS:
+        from . import filters
+        group = None
+        for i, f in enumerate(filters.filters()):
+            if i == 0:
+                _FILTER_ITEMS.append(("NONE", "No Filter", "Just the lens"))
+                continue
+            if f["group"] != group:
+                group = f["group"]
+                _FILTER_ITEMS.append(("", group.capitalize(), ""))
+            _FILTER_ITEMS.append((_slug(f["name"]), f["name"], f["about"]))
+    return _FILTER_ITEMS
 
 
 def lens_items(self, context):
@@ -119,6 +136,15 @@ class SpirulaSettings(bpy.types.PropertyGroup):
         description="A classic 35 mm manual-focus lens from Vintage Click's bag: sets the camera's "
                     "focal length and f-stop range, and gives final renders its character "
                     "(bokeh shape, cat's eyes, swirl, glow, colour fringes, fall-off)")
+    lens_filter: bpy.props.EnumProperty(
+        name="Filter", items=filter_items,
+        description="A filter on the lens, from Vintage Click: neutral density, contrast filters for "
+                    "black-and-white film, colour correction, cross screens and diffraction gratings, "
+                    "soft-focus, haze and fog")
+    use_filter_metering: bpy.props.BoolProperty(
+        name="Meter Through Filter", default=True,
+        description="Make up the light the filter takes, as a through-the-lens meter would (off: the "
+                    "filter darkens the frame by its filter factor)")
     lens_tilt: bpy.props.FloatVectorProperty(
         name="Tilt", size=2, default=(0.0, 0.0), soft_min=-15, soft_max=15, subtype='XYZ',
         description="Tilt lens only: tilt of the focus plane, degrees (x across the frame, y up and down)")
@@ -209,6 +235,16 @@ class SPIRULA_PT_render(bpy.types.Panel):
                 box.prop(s, "lens_tilt")
             elif mv.get("kind") == "shift":
                 box.label(text="Shift: use the camera's Shift X / Y (up to %g mm = %.2f)" % (mv["most"], mv["most"] / 36))
+        box.prop(s, "lens_filter")
+        from . import filters as _filters
+        flt = _filters.chosen(s)
+        if flt is not None:
+            col = box.column(align=True)
+            col.label(text=flt["about"])
+            col.label(text="Filter factor: %.2f stops" % _filters.stops(flt))
+            if not _filters.fits(flt, lens):
+                col.label(text="This lens takes rear filters: colour only, no effect", icon='ERROR')
+            col.prop(s, "use_filter_metering")
         box.prop(s, "film")
         if chosen_film(s) is not None:
             box.prop(s, "film_push")

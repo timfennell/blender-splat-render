@@ -10,7 +10,7 @@ import gpu
 import numpy as np
 from gpu_extras.presets import draw_texture_2d
 
-from . import flare, meshes, native, optics, relight, scene_data as sd, transform, viewport_meshes
+from . import filters, flare, meshes, native, optics, relight, scene_data as sd, transform, viewport_meshes
 
 # One renderer (one GPU context and one uploaded splat set) serves the viewport and
 # final renders, which can run at the same time on different threads.
@@ -130,7 +130,12 @@ def _flare_lights(depsgraph):
     return out
 
 
-def _flare_lens(lens, cam):
+def _filter_gain(f, settings):
+    """A filter's colour, and the light a through-the-lens meter makes up for it."""
+    return 2.0 ** filters.stops(f) if settings.use_filter_metering else 1.0
+
+
+def _flare_lens(lens, cam, lens_filter=None):
     """(flare lens parameters, f-number, focal length mm) for the bag lens, or for a plain
     Blender camera (a modern multi-coated lens with the camera's own aperture blades)."""
     fstop = float(cam.dof.aperture_fstop)
@@ -138,7 +143,9 @@ def _flare_lens(lens, cam):
         lens = dict(flare.GENERIC, blades=int(cam.dof.aperture_blades),
                     bladeRotation=float(cam.dof.aperture_rotation), focalMM=float(cam.lens))
     n = min(max(fstop, lens["maxAperture"]), lens.get("minAperture", 64.0))
-    return flare.lens_params(lens, n), n, float(lens["focalMM"])
+    if lens_filter is not None and not filters.fits(lens_filter, lens):
+        lens_filter = None                       # behind the lens: no ghost, no spikes
+    return flare.lens_params(lens, n, lens_filter), n, float(lens["focalMM"])
 
 
 def _lights_key(lights, settings, shadows):
@@ -701,6 +708,7 @@ class SpirulaRenderEngine(bpy.types.RenderEngine):
             loss_stops = optics.close_focus_loss(lens_now, camera_focus_m(scene, bpy.data.objects.get(cam_obj.name) or cam_obj))
         frozen = _freeze(depsgraph)
         flare_lights = _flare_lights(frozen)
+        lens_filter = filters.chosen(settings)
         cam_data = cam_obj.data
         dof = _dof_params(scene, cam_obj, cam_world) if settings.dof_samples > 1 else None
         # Show the previous frame's finished image until this one is ready.
@@ -800,18 +808,21 @@ class SpirulaRenderEngine(bpy.types.RenderEngine):
         glow = None
         if flare_lights:
             t3 = time.time()
-            P, n_fl, focal = _flare_lens(lens, cam_data)
+            P, n_fl, focal = _flare_lens(lens, cam_data, lens_filter)
             srcs = flare.sources(flare_lights, cam_world, fx, fy, cx, cy, W, H, 2.0 ** settings.exposure,
                                  focal, n_fl if dof is not None else None,
                                  dof["focus"] * dof["mpu"] if dof is not None else None,
                                  dof["mpu"] if dof is not None else 1.0)
             flare.visibility(srcs, rgba[..., 3], depth)
             glow = flare.render(srcs, P, W, H, (cx, cy)) * np.float32(2.0 ** -loss_stops)
+            if lens_filter is not None:
+                glow = glow * (np.asarray(lens_filter["transmission"], np.float32)
+                               * np.float32(_filter_gain(lens_filter, settings)))
             print(f"Spirula: lens flare from {len(srcs)} lights in {time.time() - t3:.2f}s")
-        if lens is not None or film is not None or glow is not None:
+        if lens is not None or film is not None or glow is not None or lens_filter is not None:
             t2 = time.time()
             rgba = self._finish(rgba, settings, lens, n_stop, film, (cx, cy), world, film_transparent,
-                                scene_frame, loss_stops, glow)
+                                scene_frame, loss_stops, glow, lens_filter)
             print(f"Spirula: lens and film finishing in {time.time() - t2:.2f}s")
         self._write(rgba, depth, ray, film_transparent, world, W, H, remember=True)
 
@@ -868,7 +879,7 @@ class SpirulaRenderEngine(bpy.types.RenderEngine):
         return rgba, depth
 
     def _finish(self, rgba, settings, lens, n, film, axis, world, film_transparent, frame,
-                loss_stops=0.0, glow=None):
+                loss_stops=0.0, glow=None, lens_filter=None):
         """Lens fall-off, lateral colour and streaks, the lights' flare (`glow`), then the film
         (curve, colour, grain, halation), on the frame with its background. Returns
         premultiplied rgba."""
@@ -884,6 +895,11 @@ class SpirulaRenderEngine(bpy.types.RenderEngine):
             lin = optics.lens_finish(lin, lens, n, axis) * np.float32(2.0 ** -loss_stops)
             if lens["streak"] > 0:
                 lin = lin + optics.streak(lin, lens["streak"])
+        if lens_filter is not None:
+            t3 = time.time()
+            lin = filters.apply(lin, lens_filter, settings.film_exposure if film is not None else 0.0, lens)
+            lin = lin * np.float32(_filter_gain(lens_filter, settings))
+            print(f"Spirula: {lens_filter['name']} in {time.time() - t3:.2f}s")
         if glow is not None:
             if film_transparent:
                 # over nothing the flare is light on its own: it covers as much as it shines
@@ -1105,14 +1121,17 @@ class SpirulaRenderEngine(bpy.types.RenderEngine):
             scale *= 2                               # lights moving: a lighter preview
         W, H = max(1, region.width // scale), max(1, region.height // scale)
         # Lens flare shows through the scene camera (as the lens and film do).
-        flare_lights = _flare_lights(depsgraph) if rv3d.view_perspective == 'CAMERA' and \
-            scene.camera is not None and scene.camera.type == 'CAMERA' else []
+        through_cam = rv3d.view_perspective == 'CAMERA' and scene.camera is not None and \
+            scene.camera.type == 'CAMERA'
+        flare_lights = _flare_lights(depsgraph) if through_cam else []
         flare_key = tuple((L["name"], tuple(np.round(L["pos"], 5)), tuple(np.round(L["forward"], 4)),
                            round(L["energy"], 4), tuple(L["colour"])) for L in flare_lights)
         if flare_lights:
             cam = scene.camera.data
             flare_key += (settings.lens, cam.dof.aperture_fstop, cam.dof.focus_distance, cam.dof.use_dof,
                           settings.exposure)
+        if through_cam:
+            flare_key += (settings.lens_filter, settings.use_filter_metering, settings.film_exposure)
         view_key = (tuple(map(tuple, rv3d.perspective_matrix)), W, H, flare_key)
         v = self._view
         mesh_on = settings.use_meshes and meshes.has_meshes(depsgraph)
@@ -1195,9 +1214,17 @@ class SpirulaRenderEngine(bpy.types.RenderEngine):
                 rgba = np.concatenate([rgb, alpha[..., None]], -1)
             world = scene.world.color if scene.world else (0.05, 0.05, 0.05)
             bg = np.array(list(world)[:3], np.float32)
+            lens_filter = filters.chosen(settings) if through_cam else None
+            if lens_filter is not None:
+                a = rgba[..., 3:4]
+                straight = np.where(a > 1e-6, rgba[..., :3] / np.maximum(a, 1e-6), 0.0)
+                lens_v, film_v = optics.chosen(settings)
+                straight = filters.apply(straight, lens_filter,
+                                         settings.film_exposure if film_v is not None else 0.0, lens_v)
+                rgba[..., :3] = straight * a * np.float32(_filter_gain(lens_filter, settings))
             if flare_lights:
                 lens_v, _ = optics.chosen(settings)
-                P, n_fl, focal = _flare_lens(lens_v, scene.camera.data)
+                P, n_fl, focal = _flare_lens(lens_v, scene.camera.data, lens_filter)
                 dof = _dof_params(scene, scene.camera, cam_world)
                 srcs = flare.sources(flare_lights, cam_world, fx, fy, cx, cy, W, H, 2.0 ** settings.exposure,
                                      focal, n_fl if dof is not None else None,
@@ -1205,6 +1232,9 @@ class SpirulaRenderEngine(bpy.types.RenderEngine):
                                      dof["mpu"] if dof is not None else 1.0)
                 flare.visibility(srcs, rgba[..., 3], np.where(rgba[..., 3] > 1e-3, d, np.inf))
                 glow = flare.render(srcs, P, W, H, (cx, cy))
+                if lens_filter is not None:
+                    glow = glow * (np.asarray(lens_filter["transmission"], np.float32)
+                                   * np.float32(_filter_gain(lens_filter, settings)))
                 rgba[..., :3] += glow
                 rgba[..., 3] = np.maximum(rgba[..., 3], np.minimum(glow @ flare.LUMA, 1.0))
             if not mesh_on:   # the viewport always shows the world colour behind the splats

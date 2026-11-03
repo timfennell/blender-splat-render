@@ -1,5 +1,5 @@
 {
- "source": "Splat Camera (Lens.swift, FilmStock.swift)",
+ "source": "Vintage Click (Lens.swift, FilmStock.swift, Filters.swift)",
  "collections": [
   {
    "name": "Field Assignment",
@@ -2126,6 +2126,424 @@
    "inspiredBy": "colour infrared reconnaissance slide film: leaves turn magenta-red, skin yellow, skies deep blue",
    "iso": 400.0,
    "exposures": 36.0
+  }
+ ],
+ "filters": [
+  {
+   "transmission": [
+    1.0,
+    1.0,
+    1.0
+   ],
+   "starPoints": 0,
+   "starStrength": 0.0,
+   "spectral": false,
+   "glow": 0.0,
+   "soften": 0.0,
+   "veil": 0.0,
+   "name": "No filter",
+   "about": "just the lens",
+   "group": "none"
+  },
+  {
+   "transmission": [
+    0.5,
+    0.5,
+    0.5
+   ],
+   "starPoints": 0,
+   "starStrength": 0.0,
+   "spectral": false,
+   "glow": 0.0,
+   "soften": 0.0,
+   "veil": 0.0,
+   "name": "Hoshiya ND2",
+   "about": "neutral density, 1 stop: open up a stop in bright light",
+   "group": "neutral density"
+  },
+  {
+   "transmission": [
+    0.25,
+    0.25,
+    0.25
+   ],
+   "starPoints": 0,
+   "starStrength": 0.0,
+   "spectral": false,
+   "glow": 0.0,
+   "soften": 0.0,
+   "veil": 0.0,
+   "name": "Hoshiya ND4",
+   "about": "neutral density, 2 stops",
+   "group": "neutral density"
+  },
+  {
+   "transmission": [
+    0.125,
+    0.125,
+    0.125
+   ],
+   "starPoints": 0,
+   "starStrength": 0.0,
+   "spectral": false,
+   "glow": 0.0,
+   "soften": 0.0,
+   "veil": 0.0,
+   "name": "Hoshiya ND8",
+   "about": "neutral density, 3 stops: fast film wide open in daylight",
+   "group": "neutral density"
+  },
+  {
+   "transmission": [
+    0.015625,
+    0.015625,
+    0.015625
+   ],
+   "starPoints": 0,
+   "starStrength": 0.0,
+   "spectral": false,
+   "glow": 0.0,
+   "soften": 0.0,
+   "veil": 0.0,
+   "name": "Hoshiya ND64",
+   "about": "neutral density, 6 stops: long exposures by day",
+   "group": "neutral density"
+  },
+  {
+   "transmission": [
+    0.98,
+    0.9,
+    0.3
+   ],
+   "starPoints": 0,
+   "starStrength": 0.0,
+   "spectral": false,
+   "glow": 0.0,
+   "soften": 0.0,
+   "veil": 0.0,
+   "name": "Hoshiya Y2 Yellow",
+   "about": "b&w: the everyday filter; skies a touch deeper, clouds stand out",
+   "group": "black & white"
+  },
+  {
+   "transmission": [
+    0.95,
+    0.42,
+    0.04
+   ],
+   "starPoints": 0,
+   "starStrength": 0.0,
+   "spectral": false,
+   "glow": 0.0,
+   "soften": 0.0,
+   "veil": 0.0,
+   "name": "Hoshiya G Orange",
+   "about": "b&w: dark skies, smooth skin, haze cut through",
+   "group": "black & white"
+  },
+  {
+   "transmission": [
+    0.9,
+    0.07,
+    0.02
+   ],
+   "starPoints": 0,
+   "starStrength": 0.0,
+   "spectral": false,
+   "glow": 0.0,
+   "soften": 0.0,
+   "veil": 0.0,
+   "name": "Hoshiya R1 Red",
+   "about": "b&w: dramatic black skies, foliage darkens",
+   "group": "black & white"
+  },
+  {
+   "transmission": [
+    0.8,
+    0.015,
+    0.01
+   ],
+   "starPoints": 0,
+   "starStrength": 0.0,
+   "spectral": false,
+   "glow": 0.0,
+   "soften": 0.0,
+   "veil": 0.0,
+   "name": "Rochester Wrattle No. 29 Deep Red",
+   "about": "b&w: near night-for-day; skies all but black",
+   "group": "black & white"
+  },
+  {
+   "transmission": [
+    0.3,
+    0.78,
+    0.25
+   ],
+   "starPoints": 0,
+   "starStrength": 0.0,
+   "spectral": false,
+   "glow": 0.0,
+   "soften": 0.0,
+   "veil": 0.0,
+   "name": "Hoshiya X1 Green",
+   "about": "b&w: foliage lightens, skin deepens, skies a little darker",
+   "group": "black & white"
+  },
+  {
+   "transmission": [
+    0.04,
+    0.14,
+    0.86
+   ],
+   "starPoints": 0,
+   "starStrength": 0.0,
+   "spectral": false,
+   "glow": 0.0,
+   "soften": 0.0,
+   "veil": 0.0,
+   "name": "Rochester Wrattle No. 47 Blue",
+   "about": "b&w: haze and fog deepen, reds go dark",
+   "group": "black & white"
+  },
+  {
+   "transmission": [
+    1.0,
+    0.97,
+    0.97
+   ],
+   "starPoints": 0,
+   "starStrength": 0.0,
+   "spectral": false,
+   "glow": 0.0,
+   "soften": 0.0,
+   "veil": 0.0,
+   "name": "Hoshiya Skylight 1A",
+   "about": "colour: takes the blue off shade and sky, a faint warmth",
+   "group": "colour correction"
+  },
+  {
+   "transmission": [
+    1.0,
+    0.92,
+    0.8
+   ],
+   "starPoints": 0,
+   "starStrength": 0.0,
+   "spectral": false,
+   "glow": 0.0,
+   "soften": 0.0,
+   "veil": 0.0,
+   "name": "Tiffield 81A Warming",
+   "about": "colour: a gentle warm-up, for overcast and shade",
+   "group": "colour correction"
+  },
+  {
+   "transmission": [
+    0.95,
+    0.66,
+    0.36
+   ],
+   "starPoints": 0,
+   "starStrength": 0.0,
+   "spectral": false,
+   "glow": 0.0,
+   "soften": 0.0,
+   "veil": 0.0,
+   "name": "Tiffield 85B Amber",
+   "about": "colour: tungsten film in daylight (or a golden look)",
+   "group": "colour correction"
+  },
+  {
+   "transmission": [
+    0.36,
+    0.56,
+    0.98
+   ],
+   "starPoints": 0,
+   "starStrength": 0.0,
+   "spectral": false,
+   "glow": 0.0,
+   "soften": 0.0,
+   "veil": 0.0,
+   "name": "Tiffield 80A Blue",
+   "about": "colour: daylight film under tungsten lights",
+   "group": "colour correction"
+  },
+  {
+   "transmission": [
+    1.0,
+    1.0,
+    1.0
+   ],
+   "starPoints": 4.0,
+   "starStrength": 1.0,
+   "spectral": false,
+   "glow": 0.0,
+   "soften": 0.0,
+   "veil": 0.0,
+   "name": "Hoshiya Cross Screen 4X",
+   "about": "a cross screen: four spikes off every bright point",
+   "group": "effects"
+  },
+  {
+   "transmission": [
+    1.0,
+    1.0,
+    1.0
+   ],
+   "starPoints": 6.0,
+   "starStrength": 0.85,
+   "spectral": false,
+   "glow": 0.0,
+   "soften": 0.0,
+   "veil": 0.0,
+   "name": "Hoshiya Cross Screen 6X",
+   "about": "six spikes off every bright point",
+   "group": "effects"
+  },
+  {
+   "transmission": [
+    1.0,
+    1.0,
+    1.0
+   ],
+   "starPoints": 8.0,
+   "starStrength": 0.75,
+   "spectral": false,
+   "glow": 0.0,
+   "soften": 0.0,
+   "veil": 0.0,
+   "name": "Hoshiya Cross Screen 8X",
+   "about": "eight spikes: very 70s",
+   "group": "effects"
+  },
+  {
+   "transmission": [
+    1.0,
+    1.0,
+    1.0
+   ],
+   "starPoints": 2.0,
+   "starStrength": 1.2,
+   "spectral": true,
+   "glow": 0.0,
+   "soften": 0.0,
+   "veil": 0.0,
+   "name": "Coquin Diffractor 040",
+   "about": "bright points throw rainbow streaks to either side",
+   "group": "effects"
+  },
+  {
+   "transmission": [
+    1.0,
+    1.0,
+    1.0
+   ],
+   "starPoints": 4.0,
+   "starStrength": 1.0,
+   "spectral": true,
+   "glow": 0.0,
+   "soften": 0.0,
+   "veil": 0.0,
+   "name": "Coquin Spectral Cross 041",
+   "about": "rainbow streaks in four directions",
+   "group": "effects"
+  },
+  {
+   "transmission": [
+    1.0,
+    1.0,
+    1.0
+   ],
+   "starPoints": 8.0,
+   "starStrength": 0.8,
+   "spectral": true,
+   "glow": 0.0,
+   "soften": 0.0,
+   "veil": 0.0,
+   "name": "Coquin Spectral Star 042",
+   "about": "an eight-ray rainbow starburst",
+   "group": "effects"
+  },
+  {
+   "transmission": [
+    1.0,
+    1.0,
+    1.0
+   ],
+   "starPoints": 0,
+   "starStrength": 0.0,
+   "spectral": false,
+   "glow": 0.35,
+   "soften": 0.12,
+   "veil": 0.0,
+   "name": "Tiffield Soft/Glow 1",
+   "about": "a gentle glow round highlights, still sharp beneath",
+   "group": "effects"
+  },
+  {
+   "transmission": [
+    1.0,
+    1.0,
+    1.0
+   ],
+   "starPoints": 0,
+   "starStrength": 0.0,
+   "spectral": false,
+   "glow": 0.9,
+   "soften": 0.35,
+   "veil": 0.0,
+   "name": "Tiffield Soft/Glow 3",
+   "about": "a dreamy glow: highlights bloom, edges melt",
+   "group": "effects"
+  },
+  {
+   "transmission": [
+    1.0,
+    1.0,
+    1.0
+   ],
+   "starPoints": 0,
+   "starStrength": 0.0,
+   "spectral": false,
+   "glow": 0.3,
+   "soften": 0.15,
+   "veil": 0.35,
+   "name": "Tiffield Pro-Haze 2",
+   "about": "a pale veil over everything, low contrast and soft light",
+   "group": "effects"
+  },
+  {
+   "transmission": [
+    1.0,
+    1.0,
+    1.0
+   ],
+   "starPoints": 0,
+   "starStrength": 0.0,
+   "spectral": false,
+   "glow": 0.6,
+   "soften": 0.06,
+   "veil": 0.0,
+   "name": "Tiffield Black Haze 1",
+   "about": "halos on the lights, shadows kept deep: night city film",
+   "group": "effects"
+  },
+  {
+   "transmission": [
+    1.0,
+    1.0,
+    1.0
+   ],
+   "starPoints": 0,
+   "starStrength": 0.0,
+   "spectral": false,
+   "glow": 0.4,
+   "soften": 0.25,
+   "veil": 0.8,
+   "name": "Tiffield Fog 2",
+   "about": "a heavy fog: the scene recedes into light",
+   "group": "effects"
   }
  ]
 }

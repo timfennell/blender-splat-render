@@ -53,8 +53,14 @@ def _hash(s, k):
     return float(v - np.floor(v))
 
 
-def lens_params(lens, n):
-    return dict(blades=int(lens["blades"]), rotation=float(lens["bladeRotation"]),
+def lens_params(lens, n, lens_filter=None):
+    """The flare's lens: iris, coating, dispersion, field; and the filter on it, if any (flat
+    glass adds a ghost of its own; a cross screen or grating, its spikes)."""
+    f = lens_filter
+    return dict(glass=f is not None, star_points=int(f["starPoints"]) if f else 0,
+                star_strength=float(f["starStrength"]) if f else 0.0,
+                spectral=bool(f["spectral"]) if f else False,
+                blades=int(lens["blades"]), rotation=float(lens["bladeRotation"]),
                 open=min(1.0, float(lens["maxAperture"]) / n), single=single_coated(lens),
                 seed=_seed(lens["name"]), obstruction=float(lens.get("obstruction", 0.0)),
                 squeeze=float(lens.get("squeeze", 1.0)),
@@ -138,7 +144,8 @@ def sources(lights, cam_world, fx, fy, cx, cy, W, H, gain, focal_mm=None, n=None
         uv = px / np.array([W, H])
         if not (-0.6 < uv[0] < 1.6 and -0.6 < uv[1] < 1.6):
             continue
-        out.append(dict(px=px, rgb=e * (math.pi / omega), dist=dist, blur=blur, A=A, B=B,
+        size = max(math.hypot(*A), math.hypot(*B)) / diag     # face size over the diagonal
+        out.append(dict(px=px, rgb=e * (math.pi / omega), dist=dist, blur=blur, A=A, B=B, radius=size,
                         round=round_face, face=np.asarray(face, np.float64), vis=1.0, name=L.get("name")))
     return out
 
@@ -294,6 +301,40 @@ def render(srcs, P, W, H, axis):
             rc = rr0 * (1 + P["dispersion"] * 3 * (ch - 1))
             ring[..., ch] = np.exp(-0.5 * ((dg - rc) / (w * (1 + P["field"] * 4))) ** 2)
         add += I[None, None, :] * ring * ((1e-4 if single else 2e-5) * npx / (2 * math.pi * rr0 * w * 2.5))
+
+        # A filter on the lens: its flat glass and the front element reflect the light back,
+        # a small sharp ghost mirrored through the axis.
+        if P.get("glass"):
+            cm = 2 * ax - sp
+            rm = max(s.get("radius", 0.0) * diag * 1.3, 2.5)
+            box = _box(cm[0], cm[1], rm * 4, W, H)
+            if box is not None:
+                dm2 = (xs[box[1]][None, :] - cm[0]) ** 2 + (ys[box[0]][:, None] - cm[1]) ** 2
+                mg = np.exp(-0.5 * dm2 / (rm * rm))
+                add[box] += I[None, None, :] * (8e-4 * mg * npx / (2 * math.pi * rm * rm))[..., None]
+        # A cross screen or grating: the filter's own spikes from this light.
+        spn = P.get("star_points", 0)
+        if spn > 0:
+            from .filters import spectrum
+            lines = max(1, spn // 2)
+            Ls = diag * (0.22 if P["spectral"] else 0.16)
+            star = np.zeros((H, W, 3), np.float32)
+            for j in range(lines):
+                ang = 0.35 + j * math.pi / lines
+                c, sn = math.cos(ang), math.sin(ang)
+                along = np.abs(dX * c + dY * sn)
+                across = np.abs(-dX * sn + dY * c)
+                spk = np.exp(-0.5 * (across / 1.4) ** 2) * np.exp(-3.2 * along / Ls)
+                if P["spectral"]:
+                    u = along / Ls
+                    m = np.clip((u - 0.02) / 0.08, 0, 1)
+                    m = m * m * (3 - 2 * m)
+                    col = (1 - m)[..., None] + spectrum(np.mod(u * 3.2 + 0.15, 1.0)) * m[..., None]
+                    star += (col * spk[..., None]).astype(np.float32)
+                else:
+                    star += spk[..., None]
+            star *= (dg > 0.5)[..., None]
+            add += I[None, None, :] * star * np.float32(P["star_strength"] * 0.01 * npx / (lines * Ls * 2 * 1.4 * 2.5))
 
         # Starburst: diffraction at the corners of the iris. Wide open the blades are drawn
         # back to a circle (no corners); stopped down their corners throw spikes, longer the

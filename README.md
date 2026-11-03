@@ -117,6 +117,25 @@ camera, in the viewport.
 
 ![A spotlight facing a single-coated Petzval: ghosts of the iris and glare](docs/lens_flare_petzval.jpg)
 
+**Filter** (under Lens): the 25 filters from Vintage Click's bag, screwed on the front of the lens.
+- Neutral density (ND2 to ND64), the black-and-white contrast filters (yellow, orange, red, deep
+  red, green, blue: they change how colours turn to grey on a black-and-white stock) and colour
+  correction (skylight, warming, 85B amber for tungsten film in daylight, 80A blue for daylight
+  film under tungsten): each colour passed in its own measure.
+- Cross screens (4, 6, 8 rays) and diffraction gratings (rainbow rays) off every point well above
+  the frame's average brightness, and from flaring lights.
+- Soft/glow, haze and fog: a glow round highlights, the image mixed with a little blur, a veil
+  lifting the shadows.
+- Any filter's flat glass adds a small ghost of a flaring light, mirrored through the frame's
+  centre.
+
+**Meter Through Filter** (on by default) makes up the light the filter takes, as the game's
+through-the-lens meter does; the panel shows the filter factor. Lenses with a rear filter slot
+(the mirror lens, the widest) take colour only, no effects. Filters are in final renders and,
+through the scene camera, in the viewport.
+
+![The Spectral Star 042 grating on a spotlight, at f/8](docs/filter_spectral_star.jpg)
+
 **Film:** develops final renders on the stock: its characteristic curve (toe, shoulder, black
 level), dye crosstalk and balance (tungsten stocks go blue in neutral light), saturation,
 black-and-white or colour-infrared response, grain by speed, halation on stocks without an
