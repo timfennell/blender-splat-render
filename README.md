@@ -19,6 +19,13 @@ tested; Windows and Linux builds are experimental (see [Platforms](#platforms)).
 With **Relight** on, the scene's lights light the splats, and the splats shadow themselves and each
 other.
 
+**New in 0.11 and 0.12:** [lens flare](#lenses-and-film-from-vintage-click) from any light shining
+into the lens, the 25 [lens filters](#lenses-and-film-from-vintage-click) from Vintage Click
+(cross screens, diffraction gratings, soft focus, fog, black-and-white contrast and colour
+correction), and its rangefinder lenses.
+
+![A bee scan backlit through a diffraction grating: rainbow spikes off the light and the rim-lit hairs](docs/lens_filters_hero.jpg)
+
 ## Install
 
 You need **Blender 5.3 or newer** and one of:
@@ -115,7 +122,7 @@ only as much of it as shows. With Blender's own camera (no lens chosen) the flar
 multi-coated lens with the camera's aperture blades. It's in final renders and, through the scene
 camera, in the viewport.
 
-![A spotlight facing a single-coated Petzval: ghosts of the iris and glare](docs/lens_flare_petzval.jpg)
+![A spotlight behind a bee scan, shining into the lens: a multi-coated 50 mm at f/8 throws a faint ghost and a starburst; a single-coated Petzval washes the frame with glare and bright coloured ghosts](docs/lens_flare.jpg)
 
 **Filter** (under Lens): the 25 filters from Vintage Click's bag, screwed on the front of the lens.
 - Neutral density (ND2 to ND64), the black-and-white contrast filters (yellow, orange, red, deep
@@ -134,7 +141,7 @@ through-the-lens meter does; the panel shows the filter factor. Lenses with a re
 (the mirror lens, the widest) take colour only, no effects. Filters are in final renders and,
 through the scene camera, in the viewport.
 
-![The Spectral Star 042 grating on a spotlight, at f/8](docs/filter_spectral_star.jpg)
+![The same bee and backlight through six filters: none, Cross Screen 6X, Spectral Star 042, Soft/Glow 3, Fog 2, and the R1 Red on black-and-white film](docs/lens_filters.jpg)
 
 **Film:** develops final renders on the stock: its characteristic curve (toe, shoulder, black
 level), dye crosstalk and balance (tungsten stocks go blue in neutral light), saturation,
