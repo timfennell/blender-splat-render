@@ -4,10 +4,12 @@ A Blender render engine that renders 3D Gaussian splat objects with
 [Spirula Studio](https://github.com/harry7557558/spirula-studio)'s own rasterizer, the renderer the
 models were trained with, instead of approximating them in EEVEE or Cycles.
 
-![Two bee scans relit by a point light orbiting them, with shadows cast within and between the models](docs/two_bees_orbit.gif)
+![Two bee scans relit by a tungsten lamp orbiting them, shot through a single-coated Petzval on Backlot 800T: shadows within and between the models, and the lamp's flare and ghosts as it passes behind and in front of them](docs/two_bees_orbit.gif)
 
-Two copies of a 3-million-splat bee scan, end to end, relit by a point light orbiting them (72 frames, 1280x720,
-about 22 s per frame with shadows on a MacBook Pro with M2 Pro). [MP4](docs/two_bees_orbit.mp4)
+Two copies of a 3-million-splat bee scan, nose to nose, relit by a tungsten lamp orbiting them. Shot
+through Vintage Click's Petzval 85 mm at f/5.6 (its depth of field, swirl and single-coated flare,
+ghosts with dust and fungus) on Backlot 800T. 72 frames at 1280x720, about 80 s per frame with
+shadows and 12 lens samples on a MacBook Pro with M2 Pro. [MP4](docs/two_bees_orbit.mp4)
 
 Pick **Spirula (3DGS)** as the render engine; F12 and Render Animation work as usual, from the scene
 camera. Splats erased with the Gaussian Splat Patch add-on are left out.
