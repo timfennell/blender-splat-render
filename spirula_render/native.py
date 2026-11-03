@@ -73,6 +73,10 @@ def set_splats(means, quats, log_scales, logit_opacities, dc, sh, degree):
     """All float32 C-contiguous: means [N,3], quats [N,4] wxyz, log_scales [N,3],
     logit_opacities [N], dc [N,3], sh [N,K,3] (coefficient-major) or None."""
     n = len(means)
+    if sh is None or degree <= 0:
+        # The renderer needs an SH tensor: a model with base colour only gets a zero first band
+        # (looks the same; e.g. scans trained without SH, Gaussian Splat Patch's stand-ins).
+        sh, degree = np.zeros((n, 3, 3), np.float32), 1
     arrs = [np.ascontiguousarray(a, np.float32) if a is not None else None
             for a in (means, quats, log_scales, logit_opacities, dc, sh)]
     _check(lib().sr_set_splats(n, degree, *[_p(a) for a in arrs]), "loading splats")

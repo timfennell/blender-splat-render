@@ -24,8 +24,20 @@ _LAST_FRAME = {}        # the last finished final render, shown while the next f
 _LENS_TABLES = {}       # (lens, f-number) -> pupil moments (optics.pupil_table)
 
 
-def _splat_key(obj):
+def _splat_data(obj, full=True):
+    """The object's splat point cloud. Gaussian Splat Patch can show a low-detail stand-in
+    while scans are arranged (its proxy points to the full cloud, "gsp_full"): final renders
+    use the full model, the viewport the stand-in."""
     pc = obj.data
+    if full:
+        f = pc.get("gsp_full")
+        if isinstance(f, bpy.types.PointCloud):
+            return f
+    return pc
+
+
+def _splat_key(obj, full=True):
+    pc = _splat_data(obj, full)
     return (pc.session_uid, len(pc.points), int(pc.get("gsp_revision", 0)),
             obj.name, tuple(a.name for a in pc.attributes))
 
@@ -34,7 +46,7 @@ _IDENTITY = np.eye(4)
 _OBJECTS = {}           # object name -> (data key, matrix key, world-space arrays)
 
 
-def _upload_scene(objs, report):
+def _upload_scene(objs, report, full=True):
     """Merge every splat object into one world-space set and upload it if anything changed.
 
     Each object is moved into world space (positions, rotations, scales and its SH rotated
@@ -44,11 +56,11 @@ def _upload_scene(objs, report):
     parts = []
     for ob in objs:
         original = bpy.data.objects.get(ob.name) or ob     # attribute data lives here
-        dkey = _splat_key(original)
+        dkey = _splat_key(original, full)
         mkey = tuple(np.round(np.array(ob.matrix_world, np.float64), 7).ravel())
         cached = _OBJECTS.get(ob.name)
         if cached is None or cached[0] != dkey or cached[1] != mkey:
-            local = sd.splat_arrays(original.data)
+            local = sd.splat_arrays(_splat_data(original, full))
             world = transform.to_world(local, ob.matrix_world)
             if world.get("nonuniform"):
                 report(f"Spirula: '{ob.name}' has a non-uniform scale; using its average scale")
@@ -213,7 +225,7 @@ def _render_view(depsgraph, settings, cam_world, V_of_world, fx, fy, cx, cy, W, 
             _MESH.update(tris=mesh[0], points=mesh[1], serial=mesh[2],
                          mirrors=mesh[3] if len(mesh) > 3 else None)
         try:
-            _upload_scene(splats, report)
+            _upload_scene(splats, report, full=not viewport)
             _ensure_colours(depsgraph, obj, cam_world, settings, report, follow_camera, quick,
                             viewport)
         finally:
