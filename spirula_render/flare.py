@@ -14,6 +14,11 @@ film:
 - a starburst from the iris's corners (none wide open, longer as it closes; 2n spikes for odd
   blade counts), only for a light in focus.
 
+It works wavelength by wavelength from each light's spectrum (spectra.py): ghosts and the ring
+split the light into nine bands, each bent by the glass's dispersion; a grating lays the
+spectrum along its spikes. And old glass shows in the ghosts: dust, cleaning marks, coating
+scratches, fungus, seed bubbles (glass_flaws), as Vintage Click draws them.
+
 Brightness is physical, in the relighting's units: a white surface lit by a light renders as
 that light's relative irradiance there, so the flare is what that light sends into the lens,
 spread as the lens spreads a small part of it. A light hidden behind splats or meshes (seen
@@ -23,6 +28,8 @@ through the depth of the finished frame) flares only as much as it shows.
 import math
 
 import numpy as np
+
+from . import spectra
 
 LUMA = np.array([0.2126, 0.7152, 0.0722], np.float32)
 
@@ -54,15 +61,18 @@ def _hash(s, k):
 
 
 def lens_params(lens, n, lens_filter=None):
-    """The flare's lens: iris, coating, dispersion, field; and the filter on it, if any (flat
-    glass adds a ghost of its own; a cross screen or grating, its spikes)."""
+    """The flare's lens: iris, coating, dispersion, field, the glass's flaws; and the filter on
+    it, if any (flat glass adds a ghost of its own; a cross screen or grating, its spikes)."""
     f = lens_filter
-    return dict(glass=f is not None, star_points=int(f["starPoints"]) if f else 0,
+    seed = _seed(lens["name"])
+    dust = spectra.dust_grade(lens)
+    return dict(dust=dust, bubbles=spectra.bubbles(lens), fungus=dust >= 2 and _hash(seed, 1300) < 0.55,
+                glass=f is not None, star_points=int(f["starPoints"]) if f else 0,
                 star_strength=float(f["starStrength"]) if f else 0.0,
                 spectral=bool(f["spectral"]) if f else False,
                 blades=int(lens["blades"]), rotation=float(lens["bladeRotation"]),
                 open=min(1.0, float(lens["maxAperture"]) / n), single=single_coated(lens),
-                seed=_seed(lens["name"]), obstruction=float(lens.get("obstruction", 0.0)),
+                seed=seed, obstruction=float(lens.get("obstruction", 0.0)),
                 squeeze=float(lens.get("squeeze", 1.0)),
                 dispersion=0.008 + float(lens["lateralCA"]) * 4,
                 field=0.15 + (abs(lens.get("curvatureRadial", 0.0)) + abs(lens.get("curvatureTangential", 0.0)))
@@ -145,8 +155,12 @@ def sources(lights, cam_world, fx, fy, cx, cy, W, H, gain, focal_mm=None, n=None
         if not (-0.6 < uv[0] < 1.6 and -0.6 < uv[1] < 1.6):
             continue
         size = max(math.hypot(*A), math.hypot(*B)) / diag     # face size over the diagonal
+        S = L.get("spectrum")
+        if S is None:
+            S = spectra.spectrum('COLOUR', L["colour"])
         out.append(dict(px=px, rgb=e * (math.pi / omega), dist=dist, blur=blur, A=A, B=B, radius=size,
-                        round=round_face, face=np.asarray(face, np.float64), vis=1.0, name=L.get("name")))
+                        round=round_face, face=np.asarray(face, np.float64), vis=1.0, name=L.get("name"),
+                        spectrum=S, shares=spectra.band_shares(S)))
     return out
 
 
@@ -205,6 +219,77 @@ def _aperture(dx, dy, P, soft):
     return m
 
 
+def glass_flaws(dx, dy, P, k):
+    """The glass's own flaws as ghost k shows them (dx, dy: the point in the ghost, radius 1).
+    Dust and seed bubbles cast small shadows (dust a dark speck with a faint bright fringe, a
+    bubble a dim middle with a bright rim), cleaning marks and coating scratches catch the light
+    as fine arcs and hairlines, fungus is a dark branching lace; the polish is never quite even.
+    Vintage Click's glass_flaws, the same per lens and per ghost."""
+    seed, dust = P["seed"], P["dust"]
+    if dust <= 0 and not P["bubbles"]:
+        return 1.0
+    dx, dy = (np.array(a, np.float32) for a in np.broadcast_arrays(dx, dy))
+    h = lambda x: _hash(seed, x)
+    m = np.ones_like(dx)
+    for i in range(int(dust * 4)):
+        b = k * 37 + i * 3 + 200
+        a, r = h(b) * 2 * math.pi, math.sqrt(h(b + 1)) * 0.92
+        sz = 0.022 + (0.07 - 0.022) * h(b + 2)
+        q = np.hypot(dx - r * math.cos(a), dy - r * math.sin(a)) / sz
+        m = m * (1 - 0.55 * (1 - _smoothstep(0.7, 1.0, q)) + 0.18 * np.exp(-((q - 1.15) / 0.18) ** 2))
+    if P["bubbles"]:
+        for i in range(3):
+            b = k * 37 + i * 3 + 500
+            a, r = h(b) * 2 * math.pi, math.sqrt(h(b + 1)) * 0.85
+            sz = 0.035 + (0.10 - 0.035) * h(b + 2)
+            q = np.hypot(dx - r * math.cos(a), dy - r * math.sin(a)) / sz
+            m = m * (1 - 0.35 * (1 - _smoothstep(0.6, 0.95, q)) + 0.45 * np.exp(-((q - 1.0) / 0.12) ** 2))
+    marks = np.zeros_like(dx)
+    for j in range(4):
+        b = k * 37 + j * 4 + 800
+        a = h(b) * 2 * math.pi
+        cx, cy = 1.4 * math.cos(a), 1.4 * math.sin(a)
+        R = 1.4 + (-0.8 + 1.4 * h(b + 1))
+        arc = np.abs(np.hypot(dx - cx, dy - cy) - R)
+        along = np.arctan2(dy - cy, dx - cx) - (a + math.pi)
+        span = 0.25 + 0.5 * h(b + 2)
+        wrap = np.abs(np.mod(along + 3 * math.pi, 2 * math.pi) - math.pi)
+        marks += np.exp(-(arc / 0.006) ** 2) * (1 - _smoothstep(span * 0.7, span, wrap))
+    scratches = np.zeros_like(dx)
+    for j in range(int(dust * 2)):
+        b = k * 37 + j * 5 + 1100
+        a = h(b) * math.pi
+        ox, oy = (h(b + 1) - 0.5) * 1.6, (h(b + 2) - 0.5) * 1.6
+        along = (dx - ox) * math.cos(a) + (dy - oy) * math.sin(a)
+        off = -(dx - ox) * math.sin(a) + (dy - oy) * math.cos(a)
+        ln = 0.15 + 0.6 * h(b + 3)
+        scratches += np.exp(-(off / 0.004) ** 2) * (1 - _smoothstep(ln * 0.8, ln, np.abs(along)))
+    lace = np.zeros_like(dx)
+    if P["fungus"]:
+        for c in range(2):
+            b = k * 37 + c * 9 + 1400
+            a, r = h(b) * 2 * math.pi, math.sqrt(h(b + 1)) * 0.8
+            qx, qy = dx - r * math.cos(a), dy - r * math.sin(a)
+            size = 0.12 + 0.18 * h(b + 2)
+            rr = np.hypot(qx, qy) / size
+            th = np.arctan2(qy, qx)
+            best = np.full_like(dx, 1e3)
+            for br in range(7):
+                tb = br / 7 * 2 * math.pi + h(b + 3 + br)
+                wob = tb + 0.25 * np.sin(rr * 9 + br * 2.1) + 0.12 * np.sin(rr * 23 + br)
+                dth = np.abs(np.mod(th - wob + 3 * math.pi, 2 * math.pi) - math.pi)
+                best = np.minimum(best, dth * rr * size)
+                tb2 = wob + 0.6 * (h(b + 20 + br) - 0.5) * 2
+                dth2 = np.abs(np.mod(th - tb2 - 0.4 * np.sin(rr * 13) + 3 * math.pi, 2 * math.pi) - math.pi)
+                best = np.where(rr > 0.35, np.minimum(best, dth2 * rr * size * 1.4), best)
+            strand = np.exp(-(best / 0.006) ** 2) * (1 - _smoothstep(0.6, 1.0, rr))
+            lace += np.where(rr < 1.0, strand + 0.6 * (1 - _smoothstep(0.0, 0.08, rr)), 0.0)
+    polish = 0.05 * np.sin(dx * 6.1 + seed) * np.sin(dy * 4.7 + seed * 1.7)
+    lc = np.minimum(lace, 1.0)
+    return np.maximum(m * (1 + polish) * (1 - 0.6 * lc) + marks * 0.1 * dust + scratches * 0.3
+                      + 0.15 * lc * (1 - lc) * 4, 0.0)
+
+
 def render(srcs, P, W, H, axis):
     """The flare and the lights' faces, linear [H,W,3] float32, added to the frame's light."""
     add = np.zeros((H, W, 3), np.float32)
@@ -258,7 +343,9 @@ def render(srcs, P, W, H, axis):
 
         # Veiling glare: a broad haze, strongest near the light.
         rg = diag * 0.35
-        glare = (0.006 if single else 0.0025) / (1 + (dg / rg) ** 2)
+        # worn glass (dust, scratches, fungus, haze) scatters more of the light into the haze
+        wear = 1 + 0.35 * P["dust"] + (0.8 if P["fungus"] else 0.0)
+        glare = (0.006 if single else 0.0025) * wear / (1 + (dg / rg) ** 2)
         add += I[None, None, :] * (glare * (npx / (math.pi * rg * rg * 3.0)))[..., None]
 
         # Ghosts along the line through the axis, each the aperture's shape.
@@ -274,32 +361,54 @@ def render(srcs, P, W, H, axis):
             field = math.hypot(*(cg - ax)) / diag
             focus_ghost = blur_px / rad * (0.15 + 1.05 * _hash(seed, k + 90))
             soft = 0.05 + 0.08 * _hash(seed, k + 80) + P["field"] * field + focus_ghost
-            scs = [1 + P["dispersion"] * (ch - 1) * (2.0 if single else 1.0) * (1 + 2 * abs(t)) for ch in range(3)]
-            reach = rad * max(scs) * (1 + soft) * max(P["squeeze"], 1.0) + abs(t) * diag * P["dispersion"] * 3 + 2
+            # wavelength by wavelength: bands of the light's spectrum, each its share of the
+            # light's colour, bent by the dispersion and smeared over its own span
+            bend_k = P["dispersion"] * (2.0 if single else 1.0) * (1 + 2 * abs(t))
+            bends, widths = spectra.band_bend()
+            spread = 1 + math.hypot(*(v * t)) / rad
+            scs = [1 + bend_k * b for b in bends]
+            reach = rad * max(scs) * (1 + soft + 0.6 * bend_k * spread) * max(P["squeeze"], 1.0) \
+                + abs(t) * math.hypot(*v) * bend_k * 1.6 + 2
             box = _box(cg[0], cg[1], reach, W, H)
             if box is None:
                 continue
             bx = xs[box[1]][None, :]
             by = ys[box[0]][:, None]
-            m3 = np.empty((by.shape[0], bx.shape[1], 3), np.float32)
-            for ch, sc in enumerate(scs):
+            m3 = np.zeros((by.shape[0], bx.shape[1], 3), np.float32)
+            for bd, sc in enumerate(scs):
                 c = ax + v * t * sc
                 dx = (bx - c[0]) / (rad * sc) / max(P["squeeze"], 0.5)   # an anamorphic stretches them
                 dy = (by - c[1]) / (rad * sc)
-                m3[..., ch] = _aperture(dx, dy, P, soft)
+                sb = soft + 0.5 * bend_k * widths[bd] * spread
+                m3 += _aperture(dx, dy, P, sb)[..., None] * s["shares"][bd].astype(np.float32)
             if m3.max() <= 0:
                 continue
+            m3 *= glass_flaws((bx - cg[0]) / rad / max(P["squeeze"], 0.5), (by - cg[1]) / rad, P, k)[..., None]
             rr = np.sqrt((bx - cg[0]) ** 2 + (by - cg[1]) ** 2) / rad
             rim = 0.8 + 0.4 * _smoothstep(0.6, 1.0, rr)
             add[box] += (I * tint.astype(np.float32))[None, None, :] * m3 * \
                 (g * rim * npx / (math.pi * rad * rad))[..., None]
 
+        # Scratches in the front coating: each throws a faint soft streak through the light.
+        for j in range(min(3, int(P["dust"]))):
+            a = _hash(seed, 1600 + j) * math.pi
+            c, sn = math.cos(a), math.sin(a)
+            along = np.abs(dX * c + dY * sn)
+            across = np.abs(-dX * sn + dY * c)
+            Ls = diag * (0.012 + 0.023 * _hash(seed, 1610 + j))
+            wS = max(1.5, diag * 0.0012)
+            streak = np.exp(-0.5 * (across / wS) ** 2) * np.exp(-(along / Ls) ** 1.5)
+            add += I[None, None, :] * (1e-5 * streak * npx / (Ls * 2 * wS * 2.5))[..., None].astype(np.float32)
         # A faint ring round the light (a reflection off the film and back).
         rr0, w = diag * 0.18, diag * 0.012
-        ring = np.empty((H, W, 3), np.float32)
-        for ch in range(3):
-            rc = rr0 * (1 + P["dispersion"] * 3 * (ch - 1))
-            ring[..., ch] = np.exp(-0.5 * ((dg - rc) / (w * (1 + P["field"] * 4))) ** 2)
+        ring = np.zeros((H, W, 3), np.float32)
+        ring_w = w * (1 + P["field"] * 4)
+        near = np.abs(dg - rr0) < 5 * ring_w + rr0 * P["dispersion"] * 3 * 1.6
+        if near.any():
+            for bd, b in enumerate(spectra.band_bend()[0]):
+                rc = rr0 * (1 + P["dispersion"] * 3 * b)
+                ring += np.where(near, np.exp(-0.5 * ((dg - rc) / ring_w) ** 2), 0.0)[..., None] \
+                    * s["shares"][bd].astype(np.float32)
         add += I[None, None, :] * ring * ((1e-4 if single else 2e-5) * npx / (2 * math.pi * rr0 * w * 2.5))
 
         # A filter on the lens: its flat glass and the front element reflect the light back,
@@ -315,7 +424,6 @@ def render(srcs, P, W, H, axis):
         # A cross screen or grating: the filter's own spikes from this light.
         spn = P.get("star_points", 0)
         if spn > 0:
-            from .filters import spectrum
             lines = max(1, spn // 2)
             Ls = diag * (0.22 if P["spectral"] else 0.16)
             star = np.zeros((H, W, 3), np.float32)
@@ -325,16 +433,18 @@ def render(srcs, P, W, H, axis):
                 along = np.abs(dX * c + dY * sn)
                 across = np.abs(-dX * sn + dY * c)
                 spk = np.exp(-0.5 * (across / 1.4) ** 2) * np.exp(-3.2 * along / Ls)
+                on = spk > 1e-5                     # only where the spike reaches
                 if P["spectral"]:
-                    u = along / Ls
+                    # the light's own spectrum along the spike, order by order
+                    u = along[on] / Ls
                     m = np.clip((u - 0.02) / 0.08, 0, 1)
                     m = m * m * (3 - 2 * m)
-                    col = (1 - m)[..., None] + spectrum(np.mod(u * 3.2 + 0.15, 1.0)) * m[..., None]
-                    star += (col * spk[..., None]).astype(np.float32)
+                    col = I[None, :] * (1 - m)[:, None] + spectra.grating_lamp(u, s["spectrum"], I) / 1.3 * m[:, None]
+                    star[on] += (col * spk[on][:, None]).astype(np.float32)
                 else:
-                    star += spk[..., None]
+                    star[on] += I[None, :] * spk[on][:, None]
             star *= (dg > 0.5)[..., None]
-            add += I[None, None, :] * star * np.float32(P["star_strength"] * 0.01 * npx / (lines * Ls * 2 * 1.4 * 2.5))
+            add += star * np.float32(P["star_strength"] * 0.01 * npx / (lines * Ls * 2 * 1.4 * 2.5))
 
         # Starburst: diffraction at the corners of the iris. Wide open the blades are drawn
         # back to a circle (no corners); stopped down their corners throw spikes, longer the

@@ -295,7 +295,34 @@ class SPIRULA_PT_light(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         layout.use_property_split = True
-        layout.prop(context.light, "spirula_flare")
+        L = context.light
+        layout.prop(L, "spirula_flare")
+        col = layout.column()
+        col.active = L.spirula_flare
+        col.prop(L, "spirula_spectrum")
+        if L.spirula_spectrum == 'TUNGSTEN':
+            col.prop(L, "spirula_temperature")
+        if L.spirula_spectrum != 'COLOUR':
+            col.operator("spirula.match_light_colour", icon='EYEDROPPER')
+
+
+class SPIRULA_OT_match_light_colour(bpy.types.Operator):
+    """Set the light's colour to the colour its spectrum looks, so the lighting and the flare
+    agree"""
+    bl_idname = "spirula.match_light_colour"
+    bl_label = "Match Colour to Spectrum"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.light is not None
+
+    def execute(self, context):
+        from . import spectra
+        L = context.light
+        S = spectra.spectrum(L.spirula_spectrum, tuple(L.color), L.spirula_temperature)
+        L.color = tuple(float(c) for c in spectra.colour_of(S))
+        return {'FINISHED'}
 
 
 class SPIRULA_PT_object(bpy.types.Panel):
@@ -350,6 +377,16 @@ def register():
         name="Lens Flare", default=False,
         description="When this light shines into the camera: its glowing face, ghosts of the iris, "
                     "glare, a ring and a starburst, from the lens's own optics (Vintage Click's model)")
+    from . import spectra as _spectra
+    bpy.types.Light.spirula_spectrum = bpy.props.EnumProperty(
+        name="Spectrum", items=_spectra.SPECTRUM_ITEMS, default='COLOUR',
+        description="How the light is spread over the wavelengths: what a diffraction grating fans out "
+                    "along its spikes and what the glass's dispersion bends in the ghosts. The light's "
+                    "colour still sets its colour")
+    bpy.types.Light.spirula_temperature = bpy.props.FloatProperty(
+        name="Temperature", default=3200.0, min=1000.0, max=12000.0, subtype='TEMPERATURE',
+        description="The filament's colour temperature")
+    bpy.utils.register_class(SPIRULA_OT_match_light_colour)
     bpy.utils.register_class(SPIRULA_PT_light)
     _panels(True)
     meshes.register()
@@ -363,6 +400,9 @@ def unregister():
     meshes.unregister()
     _panels(False)
     bpy.utils.unregister_class(SPIRULA_PT_light)
+    bpy.utils.unregister_class(SPIRULA_OT_match_light_colour)
+    del bpy.types.Light.spirula_spectrum
+    del bpy.types.Light.spirula_temperature
     del bpy.types.Light.spirula_flare
     bpy.utils.unregister_class(SPIRULA_PT_object)
     del bpy.types.Object.spirula_on_top

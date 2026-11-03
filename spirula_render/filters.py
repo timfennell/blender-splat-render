@@ -96,24 +96,28 @@ def _convolve(img, kernel):
 
 def _star_kernel(points, length, angle, spectral):
     """The rays of a cross screen: each line both ways, weight 3 exp(-3.2 sqrt(d/L)) / L per
-    unit length out to L (what the game's samples at d = L t^2 average to). Spectral: one
-    kernel per channel, the rainbow repeating along the ray."""
+    unit length out to L (what the game's samples at d = L t^2 average to): [k,k].
+
+    A grating's (spectral): [k,k,3,3], the colour mix out = M v at each point, M from the
+    game's table: a highlight's smooth spectrum spread order by order along the ray, white
+    (1.3 v) at its root."""
+    from . import spectra
     r = int(math.ceil(length)) + 2
     k = 2 * r + 1
-    ker = np.zeros((k, k, 3), np.float64)
     lines = max(1, points // 2)
     step = 0.25
     d = np.arange(step / 2, length, step)
     t = np.sqrt(d / length)
     w = 3.0 * np.exp(-3.2 * t) / length * step
     if spectral:
-        h = np.mod(t * 3.2 + 0.15, 1.0)
         mix = np.clip((t - 0.02) / 0.08, 0, 1)
         mix = mix * mix * (3 - 2 * mix)
-        col = (1 - mix)[:, None] + spectrum(h) * mix[:, None]
-        wc = w[:, None] * col * 1.3
+        Mu = spectra.grating_scene_matrix(t * t)                       # [n, 3, 3]
+        wc = w[:, None, None] * ((1 - mix)[:, None, None] * 1.3 * np.eye(3) + mix[:, None, None] * Mu)
+        ker = np.zeros((k, k, 3, 3), np.float64)
     else:
-        wc = np.repeat(w[:, None], 3, 1)
+        wc = w
+        ker = np.zeros((k, k), np.float64)
     for j in range(lines):
         a = angle + j * math.pi / lines
         for side in (-1, 1):
@@ -123,9 +127,28 @@ def _star_kernel(points, length, angle, spectral):
             fx, fy = x - x0, y - y0
             for dx, dy, ww in ((0, 0, (1 - fx) * (1 - fy)), (1, 0, fx * (1 - fy)),
                                (0, 1, (1 - fx) * fy), (1, 1, fx * fy)):
-                for c in range(3):
-                    np.add.at(ker[..., c], (y0 + dy, x0 + dx), wc[:, c] * ww)
+                if spectral:
+                    np.add.at(ker, (y0 + dy, x0 + dx), wc * ww[:, None, None])
+                else:
+                    np.add.at(ker, (y0 + dy, x0 + dx), wc * ww)
     return ker.astype(np.float32)
+
+
+def _convolve_mix(img, kernel):
+    """img [H,W,3] convolved with a colour-mixing kernel [k,k,3,3] (out, in), by FFT."""
+    H, W, _ = img.shape
+    k = kernel.shape[0]
+    r = k // 2
+    pad = np.pad(img, ((r, r), (r, r), (0, 0)), mode='edge')
+    sh = (pad.shape[0] + k - 1, pad.shape[1] + k - 1)
+    fh, fw = 1 << (sh[0] - 1).bit_length(), 1 << (sh[1] - 1).bit_length()
+    Fi = [np.fft.rfft2(pad[..., c], (fh, fw)) for c in range(3)]
+    out = np.empty((H, W, 3), np.float32)
+    for o in range(3):
+        acc = sum(Fi[c] * np.fft.rfft2(kernel[..., o, c], (fh, fw)) for c in range(3))
+        full = np.fft.irfft2(acc, (fh, fw))
+        out[..., o] = full[2 * r:2 * r + H, 2 * r:2 * r + W]
+    return np.maximum(out, 0.0)
 
 
 def _disc_kernel(radius):
@@ -163,8 +186,7 @@ def apply(lin, f, film_stops=0.0, lens=None, vig=None):
         hi = _above(src, thr)
         ker = _star_kernel(int(f["starPoints"]), L, 0.35, spectral)
         if spectral:
-            lum = (hi @ LUMA)[..., None]
-            add += _convolve(np.repeat(lum, 3, -1), ker) * f["starStrength"]
+            add += _convolve_mix(hi, ker) * f["starStrength"]
         else:
             add += _convolve(hi, ker) * f["starStrength"]
     if f["glow"] > 0 or f["soften"] > 0 or f["veil"] > 0:

@@ -19,10 +19,11 @@ tested; Windows and Linux builds are experimental (see [Platforms](#platforms)).
 With **Relight** on, the scene's lights light the splats, and the splats shadow themselves and each
 other.
 
-**New in 0.11 and 0.12:** [lens flare](#lenses-and-film-from-vintage-click) from any light shining
+**New in 0.11 to 0.13:** [lens flare](#lenses-and-film-from-vintage-click) from any light shining
 into the lens, the 25 [lens filters](#lenses-and-film-from-vintage-click) from Vintage Click
 (cross screens, diffraction gratings, soft focus, fog, black-and-white contrast and colour
-correction), and its rangefinder lenses.
+correction), and its rangefinder lenses. Since 0.13 the flare and gratings follow each light's
+spectrum, and old lenses' ghosts show dust, scratches, fungus and bubbles.
 
 ![A bee scan backlit through a diffraction grating: rainbow spikes off the light and the rim-lit hairs](docs/lens_filters_hero.jpg)
 
@@ -121,6 +122,23 @@ flares visibly when it's much brighter than the scene; a light behind the scan o
 only as much of it as shows. With Blender's own camera (no lens chosen) the flare is a modern
 multi-coated lens with the camera's aperture blades. It's in final renders and, through the scene
 camera, in the viewport.
+
+The flare is worked out wavelength by wavelength from the light's **Spectrum** (Light properties >
+Spirula): From Colour (a smooth spectrum fitted to the light's colour), Tungsten (at its
+temperature), Daylight, White LED, Fluorescent, Sodium, Low-Pressure Sodium or Mercury Vapour.
+**Match Colour to Spectrum** sets the light's colour to match. The glass's dispersion bends each
+part of the spectrum its own amount, so a ghost's edge runs continuously through the colours, as
+strong in each as the light is there. A diffraction grating lays the same spectrum along its
+spikes, order by order: a tungsten lamp's rainbow is dim blue and strong red, an LED's a bright
+blue band then yellow, a fluorescent tube's separate coloured dots (its lines), a low-pressure
+sodium lamp's single orange dots. Highlights in the scan spike from a smooth spectrum fitted to
+their colour. The spectra and gel curves come from Vintage Click (`tools/make_spectra.py` there).
+
+Old glass shows its age in the ghosts, as in the game. Every bag lens carries some dust (dark
+specks with a faint bright fringe), the old, rare and home-made ones more, with cleaning marks,
+coating scratches (which also throw soft streaks through a bright light) and on some of them fungus
+(a dark branching lace). The Soviet and old Jena glass has seed bubbles. Worn glass scatters more
+glare. Each lens's flaws are its own, and each ghost shows those of a different element.
 
 ![A spotlight behind a bee scan, shining into the lens: a multi-coated 50 mm at f/8 throws a faint ghost and a starburst; a single-coated Petzval washes the frame with glare and bright coloured ghosts](docs/lens_flare.jpg)
 

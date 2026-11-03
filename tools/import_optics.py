@@ -155,8 +155,12 @@ def main():
         d.update({k: value(v) for k, v in split_args(body).items()})
         filters.append(d)
 
-    json.dump({"source": "Vintage Click (Lens.swift, FilmStock.swift, Filters.swift)", "collections": collections,
-               "lenses": lenses, "films": films, "filters": filters}, open(OUT, "w"), indent=1)
+    # the lamps' and gels' spectra, for the flare and the gratings (tools/make_spectra.py there)
+    spectra = json.load(open(os.path.join(game, "tools/spectra.json")))
+
+    json.dump({"source": "Vintage Click (Lens.swift, FilmStock.swift, Filters.swift, tools/spectra.json)",
+               "collections": collections, "lenses": lenses, "films": films, "filters": filters,
+               "spectra": spectra}, open(OUT, "w"), indent=1)
     print(f"{len(lenses)} lenses in {len(collections)} collections, {len(films)} film stocks, "
           f"{len(filters)} filters -> {OUT}")
 

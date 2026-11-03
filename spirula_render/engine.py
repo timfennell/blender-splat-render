@@ -118,6 +118,9 @@ def _flare_lights(depsgraph):
         d = dict(name=ob.name, type=L.type, pos=M[:3, 3], forward=-axes[:, 2], right=axes[:, 0],
                  up=axes[:, 1], colour=tuple(L.color), energy=float(L.energy),
                  radius=float(getattr(L, "shadow_soft_size", 0.0)), angle=float(getattr(L, "angle", 0.0)))
+        from . import spectra
+        d["spectrum"] = spectra.spectrum(getattr(L, "spirula_spectrum", 'COLOUR'), tuple(L.color),
+                                         float(getattr(L, "spirula_temperature", 3200.0)))
         if L.type == 'SPOT':
             half = L.spot_size / 2
             d["spot_cos"] = (math.cos(half), math.cos(half * (1 - L.spot_blend)))
@@ -239,7 +242,9 @@ def _freeze(depsgraph):
                                shadow_soft_size=float(getattr(L, "shadow_soft_size", 0.0)),
                                size=float(getattr(L, "size", 0.0)), size_y=float(getattr(L, "size_y", 0.0)),
                                shape=getattr(L, "shape", 'SQUARE'), angle=float(getattr(L, "angle", 0.0)),
-                               spirula_flare=bool(getattr(L, "spirula_flare", False))))
+                               spirula_flare=bool(getattr(L, "spirula_flare", False)),
+                               spirula_spectrum=getattr(L, "spirula_spectrum", 'COLOUR'),
+                               spirula_temperature=float(getattr(L, "spirula_temperature", 3200.0))))
         else:
             continue
         insts.append(NS(object=proxy, matrix_world=M, is_instance=inst.is_instance))
@@ -1125,7 +1130,8 @@ class SpirulaRenderEngine(bpy.types.RenderEngine):
             scene.camera.type == 'CAMERA'
         flare_lights = _flare_lights(depsgraph) if through_cam else []
         flare_key = tuple((L["name"], tuple(np.round(L["pos"], 5)), tuple(np.round(L["forward"], 4)),
-                           round(L["energy"], 4), tuple(L["colour"])) for L in flare_lights)
+                           round(L["energy"], 4), tuple(L["colour"]),
+                           tuple(np.round(L["spectrum"], 4))) for L in flare_lights)
         if flare_lights:
             cam = scene.camera.data
             flare_key += (settings.lens, cam.dof.aperture_fstop, cam.dof.focus_distance, cam.dof.use_dof,
