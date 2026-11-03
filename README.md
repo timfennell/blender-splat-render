@@ -74,9 +74,9 @@ Reports from Windows and Linux users are very welcome.
 ![The same scene on a reportage black-and-white stock](docs/film_tripan400.jpg)
 
 The camera bag and film fridge of [Vintage Click](https://github.com/timfennell/vintage-click), the
-vintage 35 mm camera game built on the same renderer, are in the Spirula panel: 37 classic
-manual-focus lenses in six shelves (field primes, screw-mount classics, bokeh monsters, macro,
-exotics, toys and mods) and 17 film stocks, all made-up names "inspired by" real ones.
+vintage 35 mm camera game built on the same renderer, are in the Spirula panel: 47 classic
+manual-focus lenses in seven shelves (field primes, screw-mount classics, bokeh monsters, macro,
+exotics, toys and mods, and the rangefinder's own lenses) and 17 film stocks, all made-up names "inspired by" real ones.
 
 **Lens:** sets the scene camera's focal length (36 mm film), f-stop range and blades, and turns on
 depth of field. Final renders then expose through it the way the game's shutter does: the
@@ -100,6 +100,22 @@ so the lens's character comes from the same code as in the game:
 Meshes follow every sub-pupil too, including the tilted or curved focus and the barrel's
 clipping. Looking through the scene camera, the viewport shows the lens's depth of field as the
 game's finder does (one render of the whole pupil).
+
+**Lens flare** (Light properties > Spirula > Lens Flare, for each light): a light shining into
+the lens flares as the chosen lens would, with the game's model. You get the light's own face at
+its true brightness (a point or spot light's sphere, an area light's panel, the sun's disc) with
+the bloom round it, veiling glare, a faint ring, and ghosts of the iris strung along the line
+through the frame's centre: round wide open, the blades' polygon stopped down, fringed in colour,
+softer toward the edges, each with its own focus. Single-coated lenses (the Exotic and Toys
+shelves, the Petzval, the Holga) throw ghosts about ten times brighter than multi-coated ones.
+Stopped down, the iris's corners throw a starburst (2n spikes for an odd number of blades) from
+a light in focus. Brightness is physical, in the same units as the relighting, so a light only
+flares visibly when it's much brighter than the scene; a light behind the scan or a mesh flares
+only as much of it as shows. With Blender's own camera (no lens chosen) the flare is a modern
+multi-coated lens with the camera's aperture blades. It's in final renders and, through the scene
+camera, in the viewport.
+
+![A spotlight facing a single-coated Petzval: ghosts of the iris and glare](docs/lens_flare_petzval.jpg)
 
 **Film:** develops final renders on the stock: its characteristic curve (toe, shoulder, black
 level), dye crosstalk and balance (tungsten stocks go blue in neutral light), saturation,

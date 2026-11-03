@@ -245,6 +245,23 @@ class SPIRULA_PT_render(bpy.types.Panel):
             col.prop(cs, "use_denoising", text="Denoise Meshes")
 
 
+class SPIRULA_PT_light(bpy.types.Panel):
+    bl_label = "Spirula"
+    bl_space_type = 'PROPERTIES'
+    bl_region_type = 'WINDOW'
+    bl_context = "data"
+    COMPAT_ENGINES = {'SPIRULA'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.engine in cls.COMPAT_ENGINES and context.light is not None
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.prop(context.light, "spirula_flare")
+
+
 class SPIRULA_PT_object(bpy.types.Panel):
     bl_label = "Spirula"
     bl_space_type = 'PROPERTIES'
@@ -293,6 +310,11 @@ def register():
         description="Draw this object over the splats even where they're in front of it "
                     "(labels, rulers, highlight frames)")
     bpy.utils.register_class(SPIRULA_PT_object)
+    bpy.types.Light.spirula_flare = bpy.props.BoolProperty(
+        name="Lens Flare", default=False,
+        description="When this light shines into the camera: its glowing face, ghosts of the iris, "
+                    "glare, a ring and a starburst, from the lens's own optics (Vintage Click's model)")
+    bpy.utils.register_class(SPIRULA_PT_light)
     _panels(True)
     meshes.register()
     from . import engine as _engine
@@ -304,6 +326,8 @@ def unregister():
     _engine.unregister_handlers()
     meshes.unregister()
     _panels(False)
+    bpy.utils.unregister_class(SPIRULA_PT_light)
+    del bpy.types.Light.spirula_flare
     bpy.utils.unregister_class(SPIRULA_PT_object)
     del bpy.types.Object.spirula_on_top
     bpy.utils.unregister_class(SPIRULA_PT_render)

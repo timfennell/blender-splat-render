@@ -110,7 +110,7 @@ def main():
     for m in re.finditer(r"LensCollection\(name: \"([^\"]+)\", about: \"([^\"]+)\", lenses: (\w+)\)", lens_src):
         shelves[m.group(3)] = (m.group(1), m.group(2))
     lenses, collections = [], []
-    for m in re.finditer(r"private let (\w+): \[Lens\] = \[", lens_src):
+    for m in re.finditer(r"(?:private )?let (\w+): \[Lens\] = \[", lens_src):
         var = m.group(1)
         end = lens_src.index("\n]", m.end())
         coll, about = shelves.get(var, (var, ""))
