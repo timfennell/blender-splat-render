@@ -154,6 +154,14 @@ def sources(lights, cam_world, fx, fy, cx, cy, W, H, gain, focal_mm=None, n=None
         uv = px / np.array([W, H])
         if not (-0.6 < uv[0] < 1.6 and -0.6 < uv[1] < 1.6):
             continue
+        # A light leaving the picture still reaches the front glass a while: its ghosts
+        # and glare fade out from 0.2 to 0.6 frame widths beyond the edge, rather than
+        # stopping at a line (the face itself just slides out of the frame).
+        beyond = max(-uv[0], uv[0] - 1, -uv[1], uv[1] - 1)
+        fade = 1 - _smoothstep(0.2, 0.6, beyond)
+        if fade <= 0:
+            continue
+        e = e * fade
         size = max(math.hypot(*A), math.hypot(*B)) / diag     # face size over the diagonal
         S = L.get("spectrum")
         if S is None:
