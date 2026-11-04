@@ -22,7 +22,8 @@ scratches, fungus, seed bubbles (glass_flaws), as Vintage Click draws them.
 Brightness is physical, in the relighting's units: a white surface lit by a light renders as
 that light's relative irradiance there, so the flare is what that light sends into the lens,
 spread as the lens spreads a small part of it. A light hidden behind splats or meshes (seen
-through the depth of the finished frame) flares only as much as it shows.
+through the depth of the finished frame) flares only as much as it shows, and its face is
+hidden pixel by pixel behind whatever stands in front of it.
 """
 
 import math
@@ -191,6 +192,8 @@ def visibility(srcs, alpha, depth):
             if alpha[i, j] < 0.4 or not np.isfinite(z) or z > s["dist"] * 0.97:
                 seen += 1
         s["vis"] = seen / 16
+        # The face itself is hidden pixel by pixel behind whatever is nearer (render).
+        s["cover"] = (alpha, depth)
     return srcs
 
 
@@ -235,7 +238,7 @@ def glass_flaws(dx, dy, P, k):
     Vintage Click's glass_flaws, the same per lens and per ghost."""
     seed, dust = P["seed"], P["dust"]
     if dust <= 0 and not P["bubbles"]:
-        return 1.0
+        return np.ones(np.broadcast(dx, dy).shape, np.float32)     # clean glass
     dx, dy = (np.array(a, np.float32) for a in np.broadcast_arrays(dx, dy))
     h = lambda x: _hash(seed, x)
     m = np.ones_like(dx)
@@ -342,7 +345,16 @@ def render(srcs, P, W, H, axis):
                     a1, a2 = bx / rf, by / rf
                 rho = (np.sqrt(a1 * a1 + a2 * a2) if s["round"] else np.maximum(np.abs(a1), np.abs(a2))) / grow
                 m = 1 - _smoothstep(1 - soft, 1 + soft, rho)
-                add[box] += (face * vis / (grow * grow))[None, None, :] * m[..., None]
+                cover = s.get("cover")
+                if cover is not None:
+                    # Seen through whatever is nearer than the light: a trunk in front of a
+                    # lamp cuts into its face (the light's own pixels, not a dimmed whole).
+                    al, dp = cover[0][box], cover[1][box]
+                    nearer = np.isfinite(dp) & (dp < s["dist"] * 0.97)
+                    m = m * np.where(nearer, 1 - np.clip(al, 0.0, 1.0), 1.0)
+                else:
+                    m = m * vis
+                add[box] += (face / (grow * grow))[None, None, :] * m[..., None]
             lum = float(face @ LUMA)
             flux = lum * vis * math.pi * rf * rf
             r0 = 4.0 + 0.6 * rf + blur_px
